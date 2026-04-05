@@ -1,0 +1,14 @@
+venv/
+build/
+install/
+log/
+cache/
+__pycache__/
+*.pyc
+*.npy
+*.csv
+*.egg-info/
+*.o
+CMakeCache.txt
+.vscode/
+*.png
