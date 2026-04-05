@@ -1,0 +1,30 @@
+mission_manager_node:
+  ros__parameters:
+    flight_height: 0.35
+    search_span_m: 0.6
+    search_step_m: 0.15
+    min_edge_points: 20
+    goal_tolerance: 0.15
+    edge_detection_delay: 5.0
+
+edge_detector_node:
+  ros__parameters:
+    topic: /range/down
+    flight_height: 0.35
+    box_height: 0.1
+    modifier: 0.9
+    edge_detection_delay: 5.0
+    debounce_period: 0.3
+    log_csv: false
+    log_dir: '.'
+
+range_monitor_node:
+  ros__parameters:
+    topic: /range/down
+    time_window_sec: 5.0
+    z_window_sec: 1.0
+    z_threshold: 3.0
+    expected_height_m: 0.35
+    plot_update_hz: 20.0
+    log_dir: '.'
+    enable_monitor: false
