@@ -5,8 +5,6 @@
 #include <cmath>
 #include <cstdint>
 
-#include <geometry_msgs/msg/transform_stamped.hpp>
-
 namespace crazyflie_mapper
 {
 
@@ -46,23 +44,6 @@ MapperNode::MapperNode()
   publish_timer_ = this->create_wall_timer(
     std::chrono::seconds(1),
     std::bind(&MapperNode::publish_map, this));
-
-  // Static TF: map -> odom (identity). EKF corrects inside the odom frame,
-  // so map and odom coincide. Publishing this lets RViz and the planner
-  // resolve TF lookups between the two frames.
-  static_tf_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(this);
-  geometry_msgs::msg::TransformStamped t_map;
-  t_map.header.stamp = this->get_clock()->now();
-  t_map.header.frame_id = "map";
-  t_map.child_frame_id = "odom";
-  t_map.transform.translation.x = 0.0;
-  t_map.transform.translation.y = 0.0;
-  t_map.transform.translation.z = 0.0;
-  t_map.transform.rotation.x = 0.0;
-  t_map.transform.rotation.y = 0.0;
-  t_map.transform.rotation.z = 0.0;
-  t_map.transform.rotation.w = 1.0;
-  static_tf_broadcaster_->sendTransform(t_map);
 
   RCLCPP_INFO(this->get_logger(),
     "Crazyflie mapper initialized: %.1fx%.1fm (%dx%d cells) @ %.2fm/cell, origin (%.1f, %.1f)",

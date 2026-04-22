@@ -27,7 +27,7 @@ public:
 
         // Subscribers
         map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-            "/crazyflie/map", map_qos,
+            "/map", map_qos,
             std::bind(&DStarLitePathPlanningNode::mapCallback, this, std::placeholders::_1));
 
         pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(

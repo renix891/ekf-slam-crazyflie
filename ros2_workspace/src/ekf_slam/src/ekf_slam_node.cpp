@@ -76,10 +76,10 @@ private:
     void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
         // LaserScan contains 4 beams in order: [back, right, front, left]
         // Corresponding angles in body frame:
-        //   back: À (180°)
-        //   right: -À/2 (-90°)
-        //   front: 0 (0°)
-        //   left: À/2 (90°)
+        //   back: ï¿½ (180ï¿½)
+        //   right: -ï¿½/2 (-90ï¿½)
+        //   front: 0 (0ï¿½)
+        //   left: ï¿½/2 (90ï¿½)
 
         if (msg->ranges.size() != 4) {
             RCLCPP_WARN(this->get_logger(),
@@ -148,7 +148,7 @@ private:
         // Publish PoseStamped
         geometry_msgs::msg::PoseStamped pose_msg;
         pose_msg.header.stamp = stamp;
-        pose_msg.header.frame_id = "world";
+        pose_msg.header.frame_id = "map";
 
         pose_msg.pose.position.x = pose(0);
         pose_msg.pose.position.y = pose(1);
