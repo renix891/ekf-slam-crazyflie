@@ -19,9 +19,16 @@ from launch_ros.actions import Node
 # The simulation repo lives alongside ros2_workspace under the project root.
 # Using an absolute path avoids brittle ../ counts that differ between the
 # source tree and the installed launch location.
-SIM_GAZEBO_DIR = '/home/renix/EKF-SLAM-Autonomous-Crazyflie/simulation_ws/' \
-    'crazyflie-simulation/simulator_files/gazebo'
+PROJECT_DIR = '/home/renix/EKF-SLAM-Autonomous-Crazyflie'
+SIM_GAZEBO_DIR = os.path.join(
+    PROJECT_DIR, 'simulation_ws', 'crazyflie-simulation',
+    'simulator_files', 'gazebo')
 WORLD_FILE = os.path.join(SIM_GAZEBO_DIR, 'worlds', 'crazyflie_world.sdf')
+TAKEOFF_SCRIPT = os.path.join(
+    PROJECT_DIR, 'ros2_workspace', 'src', 'ekf_slam', 'scripts',
+    'gz_takeoff.py')
+BAG_DIR = os.path.join(PROJECT_DIR, 'results', 'gazebo_test_bag')
+BAG_TOPICS = ['/crazyflie/odom', '/crazyflie/scan', '/ekf_pose', '/map']
 
 
 def generate_launch_description():
@@ -70,11 +77,15 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
         output='screen')
 
-    # One-shot publisher: arm the multicopter velocity controller. Fires 3 s
-    # after the bridge starts so the ROS→GZ /crazyflie/enable bridge is up.
-    enable_motors = ExecuteProcess(
-        cmd=['ros2', 'topic', 'pub', '--once',
-             '/crazyflie/enable', 'std_msgs/msg/Bool', '{data: true}'],
+    # Scripted flight plan: arms motors, takes off, flies the sequence, lands.
+    # Replaces the separate one-shot enable publisher.
+    takeoff = ExecuteProcess(
+        cmd=['python3', TAKEOFF_SCRIPT],
+        output='screen')
+
+    # Record the key topics to a ros2 bag for offline analysis.
+    bag_record = ExecuteProcess(
+        cmd=['ros2', 'bag', 'record', '-o', BAG_DIR] + BAG_TOPICS,
         output='screen')
 
     return LaunchDescription([
@@ -83,5 +94,6 @@ def generate_launch_description():
         gz_sim,
         TimerAction(period=3.0, actions=[bridge]),
         TimerAction(period=5.0, actions=[ekf_slam, mapper]),
-        TimerAction(period=6.0, actions=[enable_motors]),
+        TimerAction(period=5.0, actions=[bag_record]),
+        TimerAction(period=3.0, actions=[takeoff]),
     ])
