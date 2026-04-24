@@ -16,7 +16,8 @@ public:
         // Initialize EKF with default noise parameters
         Eigen::Matrix3d process_noise = Eigen::Matrix3d::Identity() * 0.01;
         Eigen::Matrix2d measurement_noise = Eigen::Matrix2d::Identity() * 0.05;
-        double mahalanobis_threshold = 9.21;  // 95% confidence (chi-squared with 2 DOF)
+        // Chi-squared 95% for 2 DOF is 5.991; widened to 9.0 for this sensor's noise
+        double mahalanobis_threshold = 9.0;
 
         ekf_ = std::make_unique<ekf_slam::EKFCore>(
             process_noise, measurement_noise, mahalanobis_threshold);
@@ -53,6 +54,9 @@ private:
         double vy = msg->twist.twist.linear.y;
         double omega = msg->twist.twist.angular.z;
 
+        RCLCPP_INFO(this->get_logger(),
+            "odom rx: vx=%.3f vy=%.3f omega=%.3f", vx, vy, omega);
+
         // Compute time step
         double current_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
 
@@ -63,10 +67,6 @@ private:
             if (dt > 0.0 && dt < 1.0) {  // Ignore jumps > 1 second
                 // Prediction step
                 ekf_->predict(vx, vy, omega, dt);
-
-                RCLCPP_DEBUG(this->get_logger(),
-                    "Prediction: vx=%.3f, vy=%.3f, omega=%.3f, dt=%.3f",
-                    vx, vy, omega, dt);
             }
         }
 

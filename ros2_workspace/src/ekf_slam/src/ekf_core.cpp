@@ -182,8 +182,12 @@ int EKFCore::associateLandmark(double rho, double theta_obs) {
         // Innovation covariance
         Eigen::Matrix2d S = H * Sigma_ * H.transpose() + Q_;
 
-        // Mahalanobis distance: d^2 = �^T * S^{-1} * �
+        // Mahalanobis distance: d^2 = nu^T * S^{-1} * nu
         double mahalanobis_dist = nu.transpose() * S.inverse() * nu;
+
+        std::cerr << "[assoc] landmark " << i
+                  << " d^2=" << mahalanobis_dist
+                  << " (thr=" << mahalanobis_threshold_ << ")" << std::endl;
 
         if (mahalanobis_dist < min_mahalanobis) {
             min_mahalanobis = mahalanobis_dist;
@@ -193,8 +197,12 @@ int EKFCore::associateLandmark(double rho, double theta_obs) {
 
     // Check if best match is within threshold
     if (min_mahalanobis < mahalanobis_threshold_) {
+        std::cerr << "[assoc] matched landmark " << best_landmark
+                  << " d^2=" << min_mahalanobis << std::endl;
         return best_landmark;
     } else {
+        std::cerr << "[assoc] no match, best d^2=" << min_mahalanobis
+                  << " >= thr=" << mahalanobis_threshold_ << std::endl;
         return -1;  // No match found, new landmark
     }
 }
