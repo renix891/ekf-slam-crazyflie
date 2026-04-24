@@ -88,9 +88,16 @@ def generate_launch_description():
         cmd=['ros2', 'bag', 'record', '-o', BAG_DIR] + BAG_TOPICS,
         output='screen')
 
+    # `ros2 bag record -o` refuses to overwrite an existing directory.
+    # Clean any previous run before recording starts.
+    clean_bag_dir = ExecuteProcess(
+        cmd=['rm', '-rf', BAG_DIR],
+        output='screen')
+
     return LaunchDescription([
         declare_sim_time,
         set_resource_path,
+        clean_bag_dir,
         gz_sim,
         TimerAction(period=3.0, actions=[bridge]),
         TimerAction(period=5.0, actions=[ekf_slam, mapper]),

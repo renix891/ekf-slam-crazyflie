@@ -74,67 +74,69 @@ private:
     }
 
     void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
-        // LaserScan contains 4 beams in order: [back, right, front, left]
-        // Corresponding angles in body frame:
-        //   back: � (180�)
-        //   right: -�/2 (-90�)
-        //   front: 0 (0�)
-        //   left: �/2 (90�)
+        // // LaserScan contains 4 beams in order: [back, right, front, left]
+        // // Corresponding angles in body frame:
+        // //   back: � (180�)
+        // //   right: -�/2 (-90�)
+        // //   front: 0 (0�)
+        // //   left: �/2 (90�)
 
-        if (msg->ranges.size() != 4) {
-            RCLCPP_WARN(this->get_logger(),
-                "Expected 4 range measurements, got %zu", msg->ranges.size());
-            return;
-        }
+        // if (msg->ranges.size() != 4) {
+        //     RCLCPP_WARN(this->get_logger(),
+        //         "Expected 4 range measurements, got %zu", msg->ranges.size());
+        //     return;
+        // }
 
-        // Define bearing angles for each beam (in body frame)
-        const double bearings[4] = {
-            M_PI,      // back
-            -M_PI/2,   // right
-            0.0,       // front
-            M_PI/2     // left
-        };
+        // // Define bearing angles for each beam (in body frame)
+        // const double bearings[4] = {
+        //     M_PI,      // back
+        //     -M_PI/2,   // right
+        //     0.0,       // front
+        //     M_PI/2     // left
+        // };
 
-        const char* directions[4] = {"back", "right", "front", "left"};
+        // const char* directions[4] = {"back", "right", "front", "left"};
 
-        int measurements_processed = 0;
+        // int measurements_processed = 0;
 
-        for (size_t i = 0; i < 4; i++) {
-            double range = msg->ranges[i];
+        // for (size_t i = 0; i < 4; i++) {
+        //     double range = msg->ranges[i];
 
-            // Skip invalid measurements (inf, nan, or out of bounds)
-            if (!std::isfinite(range) || range < msg->range_min || range > msg->range_max) {
-                continue;
-            }
+        //     // Skip invalid measurements (inf, nan, or out of bounds)
+        //     if (!std::isfinite(range) || range < msg->range_min || range > msg->range_max) {
+        //         continue;
+        //     }
 
-            double rho = range;
-            double theta_obs = bearings[i];
+        //     double rho = range;
+        //     double theta_obs = bearings[i];
 
-            // Data association: find matching landmark or create new one
-            int landmark_id = ekf_->associateLandmark(rho, theta_obs);
+        //     // Data association: find matching landmark or create new one
+        //     int landmark_id = ekf_->associateLandmark(rho, theta_obs);
 
-            if (landmark_id >= 0) {
-                // Landmark exists - update
-                ekf_->update(rho, theta_obs, landmark_id);
-                RCLCPP_DEBUG(this->get_logger(),
-                    "Update landmark %d (%s): rho=%.3f, theta=%.3f",
-                    landmark_id, directions[i], rho, theta_obs);
-            } else {
-                // New landmark - add to map
-                landmark_id = ekf_->addLandmark(rho, theta_obs);
-                RCLCPP_INFO(this->get_logger(),
-                    "Added landmark %d (%s): rho=%.3f, theta=%.3f",
-                    landmark_id, directions[i], rho, theta_obs);
-            }
+        //     if (landmark_id >= 0) {
+        //         // Landmark exists - update
+        //         ekf_->update(rho, theta_obs, landmark_id);
+        //         RCLCPP_DEBUG(this->get_logger(),
+        //             "Update landmark %d (%s): rho=%.3f, theta=%.3f",
+        //             landmark_id, directions[i], rho, theta_obs);
+        //     } else {
+        //         // New landmark - add to map
+        //         landmark_id = ekf_->addLandmark(rho, theta_obs);
+        //         RCLCPP_INFO(this->get_logger(),
+        //             "Added landmark %d (%s): rho=%.3f, theta=%.3f",
+        //             landmark_id, directions[i], rho, theta_obs);
+        //     }
 
-            measurements_processed++;
-        }
+        //     measurements_processed++;
+        // }
 
-        if (measurements_processed > 0) {
-            RCLCPP_DEBUG(this->get_logger(),
-                "Processed %d measurements, total landmarks: %d",
-                measurements_processed, ekf_->getNumLandmarks());
-        }
+        // if (measurements_processed > 0) {
+        //     RCLCPP_DEBUG(this->get_logger(),
+        //         "Processed %d measurements, total landmarks: %d",
+        //         measurements_processed, ekf_->getNumLandmarks());
+        // }
+        (void)msg;
+    return;
     }
 
     void publishPose() {
