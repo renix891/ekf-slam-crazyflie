@@ -27,11 +27,24 @@ CMD_RATE_HZ = 20.0
 
 # Planar flight plan: (label, vx, vy, wz, duration_s).  No linear.z — altitude
 # is handled by the P-controller based on HOVER_HEIGHT.
+#
+# Square trajectory at 0.15 m/s in body x then y (yaw stays at 0 throughout, so
+# body and world axes coincide and the path traces a 1.0 m square in world).
+# 1.0 m / 0.15 m/s ≈ 6.67 s of pure translation per leg → plenty of distinct
+# motion for the SVD scan matcher.  Hover holds between legs let the EKF
+# settle and let the rotation/motion guards reset cleanly.
 FLIGHT_PLAN = [
-    ('forward',   0.2,  0.0, 0.0, 5.0),
-    ('yaw_360',   0.0,  0.0, 0.5, 12.56),
-    ('sideways',  0.0,  0.2, 0.0, 5.0),
-    ('return',   -0.2,  0.0, 0.0, 5.0),
+    # Body frame is FLU (REP-103): +x forward, +y left.  Yaw stays at 0 the
+    # whole flight, so body == world axes — this traces a clockwise 1.0 m
+    # square in the world frame: forward, right, back, left, returning to start.
+    ('forward',    0.15,  0.0,  0.0, 6.67),
+    ('hover_1',    0.0,   0.0,  0.0, 2.0),
+    ('right',      0.0,  -0.15, 0.0, 6.67),
+    ('hover_2',    0.0,   0.0,  0.0, 2.0),
+    ('backward',  -0.15,  0.0,  0.0, 6.67),
+    ('hover_3',    0.0,   0.0,  0.0, 2.0),
+    ('left',       0.0,   0.15, 0.0, 6.67),
+    ('hover_4',    0.0,   0.0,  0.0, 2.0),
 ]
 LAND_DURATION = 5.0        # ramp target altitude from HOVER_HEIGHT → 0.0 over this
 
