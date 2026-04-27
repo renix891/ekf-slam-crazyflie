@@ -32,6 +32,12 @@ public:
      */
     void updateScanMatch(double dx, double dy, double dtheta, double match_quality);
 
+    /**
+     * @brief Direct 1-D Kalman correction on theta from an external yaw source
+     *        (e.g. odometry quaternion).  H = [0 0 1].
+     */
+    void updateYaw(double yaw_meas, double yaw_noise = 0.01);
+
     Eigen::Vector3d  getPose() const;
     Eigen::Matrix3d  getPoseCovariance() const;
     const Eigen::Vector3d& getState() const      { return mu_; }

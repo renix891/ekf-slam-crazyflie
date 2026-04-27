@@ -1,26 +1,26 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <Eigen/Dense>
-#include <Eigen/SVD>
 
 #include "ekf_slam/ekf_core.hpp"
 
 #include <cmath>
+#include <limits>
+#include <mutex>
 #include <vector>
 
 class EKFSlamNode : public rclcpp::Node {
 public:
     EKFSlamNode() : Node("ekf_slam_node"), last_odom_time_(0.0), prev_scan_pose_(Eigen::Vector3d::Zero()) {
         Eigen::Matrix3d process_noise   = Eigen::Matrix3d::Identity() * 0.01;
-        // Bumped 0.05 -> 0.5: 4-beam translation-only scan match underestimates
-        // displacement (centroid is pulled toward symmetry of the box room),
-        // so trust odometry more and the scan match correction less.
         Eigen::Matrix3d scanmatch_noise = Eigen::Matrix3d::Identity() * 0.5;
 
         ekf_ = std::make_unique<ekf_slam::EKFCore>(process_noise, scanmatch_noise);
@@ -37,6 +37,10 @@ public:
             "/crazyflie/scan", 10,
             std::bind(&EKFSlamNode::scanCallback, this, std::placeholders::_1));
 
+        map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+            "/map", rclcpp::QoS(1).transient_local(),
+            std::bind(&EKFSlamNode::mapCallback, this, std::placeholders::_1));
+
         pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
             "/ekf_pose", 10);
         pose_cov_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -46,7 +50,7 @@ public:
             std::chrono::milliseconds(100),
             std::bind(&EKFSlamNode::publishPose, this));
 
-        RCLCPP_INFO(this->get_logger(), "EKF-SLAM (scan-match) node initialized");
+        RCLCPP_INFO(this->get_logger(), "EKF-SLAM (scan-to-map) node initialized");
     }
 
 private:
@@ -64,26 +68,119 @@ private:
             }
         }
         last_odom_time_ = current_time;
+
+        // Use the odom-reported orientation as a direct yaw measurement.
+        const auto& q = msg->pose.pose.orientation;
+        tf2::Quaternion tfq(q.x, q.y, q.z, q.w);
+        double roll, pitch, yaw_from_odom;
+        tf2::Matrix3x3(tfq).getRPY(roll, pitch, yaw_from_odom);
+        ekf_->updateYaw(yaw_from_odom);
     }
 
-    // Translation-only scan matching for sparse 4-beam multiranger data.
+    void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        current_map_ = msg;
+        map_received_ = true;
+    }
+
+    struct ScanMatchResult {
+        double dx;            // absolute world-frame x observation
+        double dy;            // absolute world-frame y observation
+        double dtheta;        // absolute world-frame theta (from odom yaw)
+        double match_quality;
+        bool   valid;
+    };
+
+    // Scan-to-map match: for each beam endpoint, find nearest occupied cell in
+    // the map and accumulate the offset.  The map averages out transient
+    // obstacle hits over time, so this is more stable than scan-to-scan when
+    // moving obstacles (or one-shot spurious returns) are present.
     //
-    // Full SVD (rotation + translation) is poorly observable with only four
-    // points roughly bounding-boxing the room — yaw and diagonal translation
-    // alias.  We trust odometry for rotation and only solve translation:
-    //     R = I,  t = centroid(points1) - centroid(points2)
-    // Returns the same 3x3 homogeneous T contract as before, with the
-    // top-left 2x2 fixed to identity.
-    static Eigen::Matrix3d scanMatch(const Eigen::Matrix2Xd& points1,
-                                     const Eigen::Matrix2Xd& points2) {
-        Eigen::Vector2d c1 = points1.rowwise().mean();
-        Eigen::Vector2d c2 = points2.rowwise().mean();
+    // Rotation is taken from odometry yaw (4-beam multiranger doesn't give us
+    // enough constraints for rotational scan matching).
+    ScanMatchResult scanToMapMatch(const std::vector<double>& ranges,
+                                   const double bearings[4],
+                                   double /*dtheta_odom*/)
+    {
+        ScanMatchResult result{0.0, 0.0, 0.0, 0.0, false};
 
-        Eigen::Vector2d t = c1 - c2;
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (!map_received_ || !current_map_) return result;
 
-        Eigen::Matrix3d T = Eigen::Matrix3d::Identity();
-        T.block<2, 1>(0, 2) = t;
-        return T;
+        // Map needs sufficient occupied cells before it can constrain matching.
+        int occupied_count = 0;
+        for (auto& cell : current_map_->data) {
+            if (cell == 100) occupied_count++;
+        }
+        if (occupied_count < 50) return result;
+
+        const double res = current_map_->info.resolution;
+        const double ox  = current_map_->info.origin.position.x;
+        const double oy  = current_map_->info.origin.position.y;
+        const int width  = static_cast<int>(current_map_->info.width);
+        const int height = static_cast<int>(current_map_->info.height);
+
+        Eigen::Vector3d pose = ekf_->getPose();
+        const double robot_x     = pose(0);
+        const double robot_y     = pose(1);
+        const double robot_theta = pose(2);
+
+        const int search_cells = static_cast<int>(0.5 / res);  // 0.5 m radius
+        const double accept_dist = 0.3;                        // m
+
+        double sum_dx = 0.0, sum_dy = 0.0;
+        double total_residual = 0.0;
+        int valid_beams = 0;
+
+        for (int i = 0; i < 4; ++i) {
+            double range = ranges[i];
+            if (!std::isfinite(range) || range < 0.01 || range > 3.49) continue;
+
+            double beam_angle_world = robot_theta + bearings[i];
+            double bx = robot_x + range * std::cos(beam_angle_world);
+            double by = robot_y + range * std::sin(beam_angle_world);
+
+            int cx = static_cast<int>((bx - ox) / res);
+            int cy = static_cast<int>((by - oy) / res);
+
+            double best_dist = std::numeric_limits<double>::infinity();
+            double best_wx = bx, best_wy = by;
+
+            for (int dy = -search_cells; dy <= search_cells; ++dy) {
+                for (int dx_cell = -search_cells; dx_cell <= search_cells; ++dx_cell) {
+                    int gx = cx + dx_cell;
+                    int gy = cy + dy;
+                    if (gx < 0 || gx >= width || gy < 0 || gy >= height) continue;
+                    int idx = gy * width + gx;
+                    if (current_map_->data[idx] == 100) {
+                        double dist = std::sqrt(static_cast<double>(dx_cell * dx_cell + dy * dy)) * res;
+                        if (dist < best_dist) {
+                            best_dist = dist;
+                            best_wx = ox + (gx + 0.5) * res;
+                            best_wy = oy + (gy + 0.5) * res;
+                        }
+                    }
+                }
+            }
+
+            if (best_dist < accept_dist) {
+                sum_dx += (best_wx - bx);
+                sum_dy += (best_wy - by);
+                total_residual += best_dist;
+                valid_beams++;
+            }
+        }
+
+        if (valid_beams < 2) return result;
+
+        // Absolute world-frame pose observation: current EKF estimate plus the
+        // averaged offset that aligns beam endpoints with map features.
+        result.dx = robot_x + sum_dx / valid_beams;
+        result.dy = robot_y + sum_dy / valid_beams;
+        result.dtheta = robot_theta;  // rotation comes from odom yaw update
+        result.match_quality = 1.0 / (1.0 + total_residual / valid_beams);
+        result.valid = true;
+        return result;
     }
 
     void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
@@ -96,104 +193,38 @@ private:
 
         const double bearings[4] = { M_PI, -M_PI/2, 0.0, M_PI/2 };
 
-        // Convert each valid beam to a 2D point in the robot body frame.
-        std::vector<Eigen::Vector2d> pts;
-        pts.reserve(4);
-        for (size_t i = 0; i < 4; ++i) {
-            double r = msg->ranges[i];
-            if (!std::isfinite(r) || r < msg->range_min || r > msg->range_max) continue;
-            pts.emplace_back(r * std::cos(bearings[i]), r * std::sin(bearings[i]));
-        }
+        std::vector<double> ranges(4);
+        for (size_t i = 0; i < 4; ++i) ranges[i] = static_cast<double>(msg->ranges[i]);
 
-        // Need at least 2 points for SVD scan matching to be meaningful.
-        if (pts.size() < 2) {
-            return;
-        }
-
-        Eigen::Matrix2Xd current(2, pts.size());
-        for (size_t i = 0; i < pts.size(); ++i) current.col(i) = pts[i];
-
-        // First scan: store and bail.
-        if (!ekf_->hasPreviousScan_) {
-            ekf_->previousScan_    = current;
-            ekf_->hasPreviousScan_ = true;
-            prev_scan_pose_        = ekf_->getPose();
-            return;
-        }
-
-        // Scan matching needs corresponding columns. The 4-beam multiranger
-        // gives ordered beams; if a beam dropped in/out between scans, sizes
-        // can differ.  Skip the update in that case rather than mis-correspond.
-        if (ekf_->previousScan_.cols() != current.cols()) {
-            ekf_->previousScan_    = current;
-            ekf_->hasPreviousScan_ = true;
-            prev_scan_pose_        = ekf_->getPose();
-            return;
-        }
-
-        // --- Rotation guard ---
-        // With only 4 beams the SVD cannot disambiguate rotation from
-        // translation; if the EKF (driven by odom predict) already says we've
-        // yawed appreciably since the previous scan, refresh the reference
-        // and skip the correction this iteration.
         Eigen::Vector3d cur_pose = ekf_->getPose();
-        double yaw_diff = cur_pose(2) - prev_scan_pose_(2);
-        while (yaw_diff >  M_PI) yaw_diff -= 2.0 * M_PI;
-        while (yaw_diff < -M_PI) yaw_diff += 2.0 * M_PI;
-        if (std::fabs(yaw_diff) > 0.1) {
-            ekf_->previousScan_ = current;
-            prev_scan_pose_     = cur_pose;
-            return;
-        }
 
         // --- Minimum-motion guard ---
-        // If the drone is hovering, scan match noise injects pure error.
+        // If the drone is hovering, scan-match noise injects pure error.
         double trans_dist = std::hypot(cur_pose(0) - prev_scan_pose_(0),
                                        cur_pose(1) - prev_scan_pose_(1));
-        if (trans_dist < 0.02) {
+        if (prev_scan_pose_set_ && trans_dist < 0.02) {
             return;
         }
 
-        // Run SVD scan match: previousScan_ ~= T_rel * current (both in body frame
-        // at their respective times). T_rel maps the *current* body frame back into
-        // the *previous* body frame.
-        Eigen::Matrix3d T_rel = scanMatch(ekf_->previousScan_, current);
+        double dtheta_odom = cur_pose(2) - prev_scan_pose_(2);
+        while (dtheta_odom >  M_PI) dtheta_odom -= 2.0 * M_PI;
+        while (dtheta_odom < -M_PI) dtheta_odom += 2.0 * M_PI;
 
-        double rel_dx     = T_rel(0, 2);
-        double rel_dy     = T_rel(1, 2);
-        double rel_dtheta = std::atan2(T_rel(1, 0), T_rel(0, 0));
-
-        // Mean residual after alignment (in the previous-scan body frame).
-        Eigen::Matrix2Xd current_h(2, current.cols());
-        for (int i = 0; i < current.cols(); ++i) {
-            Eigen::Vector3d p_h(current(0, i), current(1, i), 1.0);
-            Eigen::Vector3d q   = T_rel * p_h;
-            current_h.col(i) = q.head<2>();
+        ScanMatchResult sm = scanToMapMatch(ranges, bearings, dtheta_odom);
+        if (!sm.valid) {
+            prev_scan_pose_ = cur_pose;
+            prev_scan_pose_set_ = true;
+            return;
         }
-        double mean_residual = (ekf_->previousScan_ - current_h).colwise().norm().mean();
-        double match_quality = 1.0 / (1.0 + mean_residual);
 
-        // Compose the relative transform onto the pose at the time of the previous
-        // scan to produce an absolute world-frame pose observation.
-        double px = prev_scan_pose_(0);
-        double py = prev_scan_pose_(1);
-        double pt = prev_scan_pose_(2);
-        double cpt = std::cos(pt), spt = std::sin(pt);
-
-        double obs_x     = px + cpt * rel_dx - spt * rel_dy;
-        double obs_y     = py + spt * rel_dx + cpt * rel_dy;
-        double obs_theta = pt + rel_dtheta;
-        while (obs_theta >  M_PI) obs_theta -= 2.0 * M_PI;
-        while (obs_theta < -M_PI) obs_theta += 2.0 * M_PI;
-
-        ekf_->updateScanMatch(obs_x, obs_y, obs_theta, match_quality);
+        ekf_->updateScanMatch(sm.dx, sm.dy, sm.dtheta, sm.match_quality);
 
         RCLCPP_DEBUG(this->get_logger(),
-            "scanmatch rel=(%.3f, %.3f, %.3f) abs=(%.3f, %.3f, %.3f) q=%.3f",
-            rel_dx, rel_dy, rel_dtheta, obs_x, obs_y, obs_theta, match_quality);
+            "scan-to-map abs=(%.3f, %.3f, %.3f) q=%.3f",
+            sm.dx, sm.dy, sm.dtheta, sm.match_quality);
 
-        ekf_->previousScan_ = current;
-        prev_scan_pose_     = ekf_->getPose();
+        prev_scan_pose_ = ekf_->getPose();
+        prev_scan_pose_set_ = true;
     }
 
     void publishPose() {
@@ -232,14 +263,20 @@ private:
 
     std::unique_ptr<ekf_slam::EKFCore> ekf_;
 
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr      odom_sub_;
-    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr  scan_sub_;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        odom_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr    scan_sub_;
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr   map_sub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr   pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_cov_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     double          last_odom_time_;
     Eigen::Vector3d prev_scan_pose_;
+    bool            prev_scan_pose_set_ = false;
+
+    nav_msgs::msg::OccupancyGrid::SharedPtr current_map_;
+    bool                                    map_received_ = false;
+    std::mutex                              map_mutex_;
 };
 
 int main(int argc, char** argv) {

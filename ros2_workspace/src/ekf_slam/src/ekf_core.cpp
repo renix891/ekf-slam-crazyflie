@@ -46,6 +46,15 @@ void EKFCore::updateScanMatch(double dx, double dy, double dtheta, double match_
         return;
     }
 
+    // Outlier guard: if the scan-match observation disagrees with the current
+    // estimate by more than 0.5 m in a single update, the match is almost
+    // certainly degenerate (symmetric room, beam dropout, sudden yaw).
+    double inno_x = dx - mu_(0);
+    double inno_y = dy - mu_(1);
+    if (std::hypot(inno_x, inno_y) > 0.5) {
+        return;
+    }
+
     Eigen::Matrix3d Q = Q_scanmatch_ / (match_quality + 1e-6);
 
     Eigen::Matrix3d H = Eigen::Matrix3d::Identity();
@@ -53,14 +62,32 @@ void EKFCore::updateScanMatch(double dx, double dy, double dtheta, double match_
     Eigen::Matrix3d K = Sigma_ * H.transpose() * S.inverse();
 
     Eigen::Vector3d nu;
-    nu(0) = dx     - mu_(0);
-    nu(1) = dy     - mu_(1);
+    nu(0) = inno_x;
+    nu(1) = inno_y;
     nu(2) = normalizeAngle(dtheta - mu_(2));
 
     mu_    = mu_ + K * nu;
     mu_(2) = normalizeAngle(mu_(2));
 
     Sigma_ = (Eigen::Matrix3d::Identity() - K * H) * Sigma_;
+}
+
+void EKFCore::updateYaw(double yaw_meas, double yaw_noise) {
+    // 1-D Kalman update on theta only.  H = [0 0 1] in the 3-D state, so
+    //   S       = Sigma_(2,2) + R
+    //   K (3x1) = Sigma_.col(2) / S       (cross-covariance with x, y included)
+    //   mu_    += K * nu
+    //   Sigma_ -= K * Sigma_.row(2)
+    double nu = normalizeAngle(yaw_meas - mu_(2));
+    double S  = Sigma_(2, 2) + yaw_noise;
+    if (S <= 0.0) return;
+
+    Eigen::Vector3d K = Sigma_.col(2) / S;
+
+    mu_   += K * nu;
+    mu_(2) = normalizeAngle(mu_(2));
+
+    Sigma_ -= K * Sigma_.row(2);
 }
 
 Eigen::Vector3d EKFCore::getPose() const           { return mu_; }

@@ -12,6 +12,8 @@ and the 4-beam lidar samples a horizontal slice. This script preserves that
 assumption: climb vertically once, then only planar velocities.
 """
 
+import math
+
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -25,27 +27,19 @@ VZ_KP = 2.0                # altitude-hold P-gain (matches autonomous_nav defaul
 VZ_CLAMP = 0.2             # |linear.z| saturation during hover/flight (m/s)
 CMD_RATE_HZ = 20.0
 
-# Planar flight plan: (label, vx, vy, wz, duration_s).  No linear.z — altitude
-# is handled by the P-controller based on HOVER_HEIGHT.
+# Figure-8: two tangent circles traversed in opposite directions.
+# Yaw stays at 0 throughout, so body == world axes — the (vx, vy) below are
+# both body-frame commands and world-frame velocities.
 #
-# Square trajectory at 0.15 m/s in body x then y (yaw stays at 0 throughout, so
-# body and world axes coincide and the path traces a 1.0 m square in world).
-# 1.0 m / 0.15 m/s ≈ 6.67 s of pure translation per leg → plenty of distinct
-# motion for the SVD scan matcher.  Hover holds between legs let the EKF
-# settle and let the rotation/motion guards reset cleanly.
-FLIGHT_PLAN = [
-    # Body frame is FLU (REP-103): +x forward, +y left.  Yaw stays at 0 the
-    # whole flight, so body == world axes — this traces a clockwise 1.0 m
-    # square in the world frame: forward, right, back, left, returning to start.
-    ('forward',    0.15,  0.0,  0.0, 6.67),
-    ('hover_1',    0.0,   0.0,  0.0, 2.0),
-    ('right',      0.0,  -0.15, 0.0, 6.67),
-    ('hover_2',    0.0,   0.0,  0.0, 2.0),
-    ('backward',  -0.15,  0.0,  0.0, 6.67),
-    ('hover_3',    0.0,   0.0,  0.0, 2.0),
-    ('left',       0.0,   0.15, 0.0, 6.67),
-    ('hover_4',    0.0,   0.0,  0.0, 2.0),
-]
+#   speed v = 0.15 m/s, radius R = 0.5 m  ->  omega = v/R = 0.3 rad/s.
+#   One full lap = 2*pi/omega ≈ 20.94 s; we run each lap for 20 s, which is
+#   just shy of a full revolution and gives the EKF a continuous curving
+#   trajectory (no discrete corners as in the prior square plan).
+CIRCLE_SPEED = 0.15        # m/s tangential
+CIRCLE_RADIUS = 0.5        # m
+CIRCLE_OMEGA = CIRCLE_SPEED / CIRCLE_RADIUS  # rad/s
+CIRCLE_DURATION = 20.0     # s per lap
+
 LAND_DURATION = 5.0        # ramp target altitude from HOVER_HEIGHT → 0.0 over this
 
 
@@ -61,10 +55,8 @@ class GzTakeoffDriver(Node):
         # State
         self.current_z = 0.0
         self.have_odom = False
-        self.phase = 'arming'        # arming → climb → plan → land → done
-        self.plan_idx = 0
+        self.phase = 'arming'        # arming → climb → circle_cw → circle_ccw → land → done
         self.phase_t0 = None         # sim-time seconds when current phase started
-        self.plan_cmd = (0.0, 0.0, 0.0)  # (vx, vy, wz) for current plan step
         self.target_alt = HOVER_HEIGHT  # altitude setpoint (ramped down during land)
 
         self.create_timer(1.0 / CMD_RATE_HZ, self._control_tick)
@@ -76,7 +68,7 @@ class GzTakeoffDriver(Node):
             self.enable_pub.publish(arm)
 
         self.get_logger().info(
-            f'armed; climbing to {HOVER_HEIGHT} m before planar flight plan')
+            f'armed; climbing to {HOVER_HEIGHT} m before figure-8 flight plan')
 
     def _on_odom(self, msg: Odometry):
         self.current_z = msg.pose.pose.position.z
@@ -103,6 +95,21 @@ class GzTakeoffDriver(Node):
         cmd.angular.z = float(wz)
         self.cmd_pub.publish(cmd)
 
+    def _circle_velocity(self, t, clockwise):
+        """Body-frame (vx, vy) tracing a circle tangent to the +x axis at t=0.
+
+        At t=0 the velocity is (CIRCLE_SPEED, 0).  The sign of vy decides the
+        rotation direction:
+            clockwise=True  -> drone curves toward -y (right)
+            clockwise=False -> drone curves toward +y (left)
+        Together these two laps form a figure-8 centered on the start point.
+        """
+        vx = CIRCLE_SPEED * math.cos(CIRCLE_OMEGA * t)
+        vy = CIRCLE_SPEED * math.sin(CIRCLE_OMEGA * t)
+        if clockwise:
+            vy = -vy
+        return vx, vy
+
     def _control_tick(self):
         if not self.have_odom:
             # Hold on the ground until we see odometry (so we know our altitude).
@@ -120,37 +127,35 @@ class GzTakeoffDriver(Node):
         if self.phase == 'climb':
             # Drive straight vertical until we reach hover altitude.
             if self.current_z >= HOVER_HEIGHT:
-                self.phase = 'plan'
-                self.plan_idx = 0
+                self.phase = 'circle_cw'
                 self.phase_t0 = now
-                label, vx, vy, wz, _ = FLIGHT_PLAN[0]
-                self.plan_cmd = (vx, vy, wz)
                 self.get_logger().info(
-                    f'reached {self.current_z:.2f} m — starting plan '
-                    f'phase 1/{len(FLIGHT_PLAN)}: {label}')
+                    f'reached {self.current_z:.2f} m — starting CW circle '
+                    f'(R={CIRCLE_RADIUS} m, v={CIRCLE_SPEED} m/s)')
             else:
                 self._publish(0.0, 0.0, CLIMB_VZ, 0.0)
                 return
 
-        if self.phase == 'plan':
-            label, vx, vy, wz, duration = FLIGHT_PLAN[self.plan_idx]
+        if self.phase == 'circle_cw':
             elapsed = now - self.phase_t0
-            if elapsed >= duration:
-                self.plan_idx += 1
-                if self.plan_idx >= len(FLIGHT_PLAN):
-                    self.phase = 'land'
-                    self.phase_t0 = now
-                    self.get_logger().info('plan complete — starting land')
-                else:
-                    label, vx, vy, wz, _ = FLIGHT_PLAN[self.plan_idx]
-                    self.plan_cmd = (vx, vy, wz)
-                    self.phase_t0 = now
-                    self.get_logger().info(
-                        f'phase {self.plan_idx+1}/{len(FLIGHT_PLAN)}: {label} '
-                        f'(vx={vx} vy={vy} wz={wz}) for {duration}s')
+            if elapsed >= CIRCLE_DURATION:
+                self.phase = 'circle_ccw'
+                self.phase_t0 = now
+                self.get_logger().info('CW lap done — starting CCW lap')
             else:
-                vx, vy, wz = self.plan_cmd
-                self._publish(vx, vy, self._altitude_hold_vz(), wz)
+                vx, vy = self._circle_velocity(elapsed, clockwise=True)
+                self._publish(vx, vy, self._altitude_hold_vz(), 0.0)
+                return
+
+        if self.phase == 'circle_ccw':
+            elapsed = now - self.phase_t0
+            if elapsed >= CIRCLE_DURATION:
+                self.phase = 'land'
+                self.phase_t0 = now
+                self.get_logger().info('figure-8 complete — starting land')
+            else:
+                vx, vy = self._circle_velocity(elapsed, clockwise=False)
+                self._publish(vx, vy, self._altitude_hold_vz(), 0.0)
                 return
 
         if self.phase == 'land':
