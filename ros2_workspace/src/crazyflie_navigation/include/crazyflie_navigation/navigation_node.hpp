@@ -16,7 +16,9 @@ namespace crazyflie_navigation
 enum class WaypointState
 {
   MOVING,
-  SCANNING
+  SCANNING,
+  LANDING,
+  IDLE
 };
 
 class NavigationNode : public rclcpp::Node
@@ -35,6 +37,7 @@ private:
 
   bool rotate_to_target(double target_yaw);
   void publish_zero_velocity();
+  double altitude_hold_vz() const;
 
   static double quaternion_to_yaw(const geometry_msgs::msg::Quaternion & q);
   static double normalize_angle(double angle);
@@ -45,10 +48,15 @@ private:
   // Parameters
   double waypoint_tolerance_;
   double scanning_yaw_rate_;
+  double scan_timeout_s_;
   double flight_height_;
   double rotation_tolerance_;
   double yaw_kp_;
   double vz_kp_;
+  double vz_max_;
+  double max_velocity_;
+  double approach_distance_;
+  double approach_velocity_;
 
   // State
   bool enabled_;
@@ -57,6 +65,7 @@ private:
   size_t current_waypoint_idx_;
   WaypointState waypoint_state_;
   std::optional<double> target_yaw_;
+  std::optional<rclcpp::Time> scan_started_at_;
 
   // IO
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;

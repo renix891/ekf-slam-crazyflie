@@ -196,14 +196,16 @@ private:
                 int8_t val = grid_msg.data[idx];
 
                 if (val < 0) {
-                    // Unknown: slight penalty
-                    cost_map[x][y] = 2.0;
+                    // Unknown: mild penalty
+                    cost_map[x][y] = 3.0;
                 } else if (val == 0) {
                     // Free: low cost
                     cost_map[x][y] = 1.0;
                 } else if (val <= 50) {
-                    // Weighted avoidance zone: scale 1-50 to 2.0-10.0
-                    cost_map[x][y] = 2.0 + (val / 50.0) * 8.0;
+                    // Weighted avoidance zone near obstacles: gentle ramp
+                    // (3.0-10.0) — keeps some clearance preference while
+                    // leaving the planner room to route around obstacles.
+                    cost_map[x][y] = 3.0 + (val / 50.0) * 7.0;
                 } else {
                     // Obstacle: infinite cost
                     cost_map[x][y] = std::numeric_limits<double>::infinity();
@@ -264,8 +266,26 @@ private:
         path_msg.header.stamp = this->now();
         path_msg.header.frame_id = occupancy_grid_msg_->header.frame_id;
 
-        for (const auto& [gx, gy] : path) {
-            auto [wx, wy] = gridToWorld(gx, gy);
+        // Skip leading waypoints within START_SKIP_RADIUS of the current pose so
+        // the navigator doesn't auto-complete a waypoint sitting on the start
+        // grid cell and burn its scan-timeout before any real motion occurs.
+        constexpr double START_SKIP_RADIUS = 0.15;
+        const double cur_x = current_pose_ ? current_pose_->pose.position.x : 0.0;
+        const double cur_y = current_pose_ ? current_pose_->pose.position.y : 0.0;
+        const bool have_pose = static_cast<bool>(current_pose_);
+
+        size_t start_idx = 0;
+        if (have_pose) {
+            for (; start_idx + 1 < path.size(); ++start_idx) {
+                auto [wx, wy] = gridToWorld(path[start_idx].first, path[start_idx].second);
+                if (std::hypot(wx - cur_x, wy - cur_y) >= START_SKIP_RADIUS) {
+                    break;
+                }
+            }
+        }
+
+        for (size_t i = start_idx; i < path.size(); ++i) {
+            auto [wx, wy] = gridToWorld(path[i].first, path[i].second);
 
             geometry_msgs::msg::PoseStamped ps;
             ps.header = path_msg.header;
@@ -275,6 +295,10 @@ private:
             ps.pose.orientation.w = 1.0;
 
             path_msg.poses.push_back(ps);
+        }
+
+        if (path_msg.poses.empty()) {
+            return;
         }
 
         path_pub_->publish(path_msg);

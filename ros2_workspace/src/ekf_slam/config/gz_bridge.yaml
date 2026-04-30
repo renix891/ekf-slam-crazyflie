@@ -4,6 +4,12 @@
   gz_type_name: gz.msgs.LaserScan
   direction: GZ_TO_ROS
 
+- ros_topic_name: /crazyflie/range/down
+  gz_topic_name: /down_range
+  ros_type_name: sensor_msgs/msg/LaserScan
+  gz_type_name: gz.msgs.LaserScan
+  direction: GZ_TO_ROS
+
 - ros_topic_name: /crazyflie/odom
   gz_topic_name: /model/crazyflie/odometry
   ros_type_name: nav_msgs/msg/Odometry

@@ -17,12 +17,17 @@ NavigationNode::NavigationNode()
   target_yaw_(std::nullopt)
 {
   // Parameters
-  waypoint_tolerance_ = this->declare_parameter<double>("waypoint_tolerance", 0.2);
-  scanning_yaw_rate_ = this->declare_parameter<double>("scanning_yaw_rate", 1.0);
+  waypoint_tolerance_ = this->declare_parameter<double>("waypoint_tolerance", 0.1);
+  scanning_yaw_rate_ = this->declare_parameter<double>("scanning_yaw_rate", 0.2);
+  scan_timeout_s_ = this->declare_parameter<double>("scan_timeout_s", 8.0);
   flight_height_ = this->declare_parameter<double>("flight_height", 0.3);
   rotation_tolerance_ = this->declare_parameter<double>("rotation_tolerance", 0.1);
   yaw_kp_ = this->declare_parameter<double>("yaw_kp", 2.0);
   vz_kp_ = this->declare_parameter<double>("vz_kp", 1.0);
+  vz_max_ = this->declare_parameter<double>("vz_max", 0.2);
+  max_velocity_ = this->declare_parameter<double>("max_velocity", 0.3);
+  approach_distance_ = this->declare_parameter<double>("approach_distance", 0.1);
+  approach_velocity_ = this->declare_parameter<double>("approach_velocity", 0.1);
 
   // Subscribers — use EKF-corrected pose, not raw odometry
   pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -88,6 +93,7 @@ void NavigationNode::enable_callback(
     current_waypoint_idx_ = 0;
     waypoint_state_ = WaypointState::MOVING;
     target_yaw_ = std::nullopt;
+    scan_started_at_ = std::nullopt;
   }
 }
 
@@ -141,9 +147,7 @@ bool NavigationNode::rotate_to_target(double target_yaw)
 
   geometry_msgs::msg::Twist cmd;
   cmd.angular.z = yaw_rate_cmd;
-
-  double z_err = flight_height_ - current_pose_->pose.position.z;
-  cmd.linear.z = vz_kp_ * z_err;
+  cmd.linear.z = altitude_hold_vz();
 
   cmd_vel_pub_->publish(cmd);
   return false;
@@ -175,9 +179,20 @@ void NavigationNode::control_loop()
     double tolerance = is_final_waypoint ? (waypoint_tolerance_ / 5.0) : waypoint_tolerance_;
 
     if (dist < tolerance) {
+      if (is_final_waypoint) {
+        // Don't scan at the goal — descend and land.
+        waypoint_state_ = WaypointState::LANDING;
+        target_yaw_ = std::nullopt;
+        scan_started_at_ = std::nullopt;
+        RCLCPP_INFO(this->get_logger(),
+          "Final waypoint reached - initiating landing");
+        return;
+      }
+
       double current_yaw = quaternion_to_yaw(current_pose_->pose.orientation);
       target_yaw_ = normalize_angle(current_yaw + M_PI / 2.0);
       waypoint_state_ = WaypointState::SCANNING;
+      scan_started_at_ = this->now();
       RCLCPP_INFO(this->get_logger(),
         "Waypoint %zu reached - starting scan rotation to %.1f deg",
         current_waypoint_idx_, target_yaw_.value() * 180.0 / M_PI);
@@ -189,26 +204,72 @@ void NavigationNode::control_loop()
     double vx_world = dx * inv_mag;
     double vy_world = dy * inv_mag;
 
+    // Slow down on final approach so the controller can settle without
+    // overshoot/tumble; otherwise cruise at max_velocity.
+    double speed = (dist < approach_distance_) ? approach_velocity_ : max_velocity_;
+    vx_world *= speed;
+    vy_world *= speed;
+
     double current_yaw = quaternion_to_yaw(current_pose_->pose.orientation);
     double vx_body, vy_body;
     world_to_body_frame(vx_world, vy_world, current_yaw, vx_body, vy_body);
 
+    // Defensive clamp — guarantees we never exceed max_velocity even if some
+    // future change here introduces extra scaling.
+    vx_body = std::clamp(vx_body, -max_velocity_, max_velocity_);
+    vy_body = std::clamp(vy_body, -max_velocity_, max_velocity_);
+
     geometry_msgs::msg::Twist cmd;
     cmd.linear.x = vx_body;
     cmd.linear.y = vy_body;
-
-    double z_err = flight_height_ - current_pose_->pose.position.z;
-    cmd.linear.z = vz_kp_ * z_err;
+    cmd.linear.z = altitude_hold_vz();
 
     cmd_vel_pub_->publish(cmd);
 
   } else if (waypoint_state_ == WaypointState::SCANNING) {
-    if (target_yaw_.has_value() && rotate_to_target(target_yaw_.value())) {
+    bool scan_done = target_yaw_.has_value() && rotate_to_target(target_yaw_.value());
+
+    bool timed_out = false;
+    if (!scan_done && scan_started_at_.has_value()) {
+      double elapsed = (this->now() - scan_started_at_.value()).seconds();
+      if (elapsed >= scan_timeout_s_) {
+        timed_out = true;
+        RCLCPP_WARN(this->get_logger(),
+          "Scan rotation timed out after %.1fs at waypoint %zu - advancing anyway",
+          elapsed, current_waypoint_idx_);
+        publish_zero_velocity();
+      }
+    }
+
+    if (scan_done || timed_out) {
       current_waypoint_idx_ += 1;
       waypoint_state_ = WaypointState::MOVING;
+      target_yaw_ = std::nullopt;
+      scan_started_at_ = std::nullopt;
       RCLCPP_INFO(this->get_logger(),
-        "Scan rotation complete - advancing to waypoint %zu", current_waypoint_idx_);
+        "Advancing to waypoint %zu", current_waypoint_idx_);
     }
+  } else if (waypoint_state_ == WaypointState::LANDING) {
+    double current_z = current_pose_->pose.position.z;
+
+    if (current_z > 0.05) {
+      geometry_msgs::msg::Twist cmd;
+      cmd.linear.x = 0.0;
+      cmd.linear.y = 0.0;
+      cmd.linear.z = -0.15;
+      cmd.angular.z = 0.0;
+      cmd_vel_pub_->publish(cmd);
+    } else {
+      // Touched down — disable navigation and stop sending altitude-hold
+      // velocities, so the firmware can cut motors instead of fighting us.
+      geometry_msgs::msg::Twist cmd;
+      cmd_vel_pub_->publish(cmd);
+      waypoint_state_ = WaypointState::IDLE;
+      enabled_ = false;
+      RCLCPP_INFO(this->get_logger(), "Landed successfully!");
+    }
+  } else if (waypoint_state_ == WaypointState::IDLE) {
+    // Goal reached and landed — do nothing.
   }
 }
 
@@ -237,7 +298,14 @@ void NavigationNode::status_loop()
                 curr_x, curr_y, curr_z, curr_yaw * 180.0 / M_PI);
   s << buf;
 
-  s << " | state=" << (waypoint_state_ == WaypointState::MOVING ? "MOVING" : "SCANNING");
+  const char * state_str = "UNKNOWN";
+  switch (waypoint_state_) {
+    case WaypointState::MOVING:   state_str = "MOVING"; break;
+    case WaypointState::SCANNING: state_str = "SCANNING"; break;
+    case WaypointState::LANDING:  state_str = "LANDING"; break;
+    case WaypointState::IDLE:     state_str = "IDLE"; break;
+  }
+  s << " | state=" << state_str;
 
   if (planned_path_.empty()) {
     s << " | NO_PATH";
@@ -277,9 +345,23 @@ void NavigationNode::status_loop()
   RCLCPP_INFO(this->get_logger(), "Status: %s", s.str().c_str());
 }
 
+double NavigationNode::altitude_hold_vz() const
+{
+  if (current_pose_ == nullptr) {
+    return 0.0;
+  }
+  double z_err = flight_height_ - current_pose_->pose.position.z;
+  double vz = vz_kp_ * z_err;
+  return std::clamp(vz, -vz_max_, vz_max_);
+}
+
 void NavigationNode::publish_zero_velocity()
 {
-  cmd_vel_pub_->publish(geometry_msgs::msg::Twist());
+  // "Zero" means no horizontal motion and no rotation, but the drone must
+  // still hold altitude — a literal zero Twist makes the CF freefall.
+  geometry_msgs::msg::Twist cmd;
+  cmd.linear.z = altitude_hold_vz();
+  cmd_vel_pub_->publish(cmd);
 }
 
 }  // namespace crazyflie_navigation
