@@ -2,17 +2,17 @@ Autonomous navigation — EKF vs raw odometry
 Goal pose: (0.80, 0.00) m
 
 [EKF run]   /home/renix/EKF-SLAM-Autonomous-Crazyflie/results/gazebo_full_nav_ekf_bag
-  samples       : 184
-  duration      : 18.30 s
-  final pos     : (0.002, -0.001) m
-  dist to goal  : 0.798 m
+  samples       : 378
+  duration      : 37.70 s
+  final pos     : (0.771, -0.010) m
+  dist to goal  : 0.031 m
   tail jitter   : 0.0000 m (last 1 s)
 
 [Odom run]  /home/renix/EKF-SLAM-Autonomous-Crazyflie/results/gazebo_full_nav_odom_only_bag
-  samples       : 1713
-  duration      : 34.12 s
-  final pos     : (-0.001, 0.001) m
-  dist to goal  : 0.801 m
+  samples       : 1703
+  duration      : 34.09 s
+  final pos     : (0.771, -0.013) m
+  dist to goal  : 0.032 m
   tail jitter   : 0.0000 m (last 1 s)
 
-Landing-error delta (odom - ekf): +0.003 m  →  EKF closer to goal
+Landing-error delta (odom - ekf): +0.001 m  →  EKF closer to goal

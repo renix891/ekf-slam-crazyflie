@@ -301,6 +301,16 @@ private:
             return;
         }
 
+        // Replace the grid-snapped final pose with the exact goal so the
+        // navigator's tight final tolerance is measured against the real
+        // target, not the centre of whatever cell the goal landed in
+        // (off by up to half a resolution otherwise).
+        if (goal_pose_) {
+            auto & last = path_msg.poses.back();
+            last.pose.position.x = goal_pose_->pose.position.x;
+            last.pose.position.y = goal_pose_->pose.position.y;
+        }
+
         path_pub_->publish(path_msg);
     }
 

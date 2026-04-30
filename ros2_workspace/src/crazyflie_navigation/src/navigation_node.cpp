@@ -176,7 +176,10 @@ void NavigationNode::control_loop()
     double dist = std::hypot(dx, dy);
 
     bool is_final_waypoint = (current_waypoint_idx_ == planned_path_.size() - 1);
-    double tolerance = is_final_waypoint ? (waypoint_tolerance_ / 5.0) : waypoint_tolerance_;
+    // Final waypoint = the exact goal cell (planning_node forces this), so
+    // hold the drone to a tight 5 cm before declaring "arrived" and landing.
+    // Intermediate waypoints can use the looser configured tolerance.
+    double tolerance = is_final_waypoint ? 0.05 : waypoint_tolerance_;
 
     if (dist < tolerance) {
       if (is_final_waypoint) {
@@ -321,7 +324,7 @@ void NavigationNode::status_loop()
         double dy = wp.pose.position.y - curr_y;
         double dist = std::hypot(dx, dy);
         bool is_final = (current_waypoint_idx_ == planned_path_.size() - 1);
-        double tol = is_final ? (waypoint_tolerance_ / 5.0) : waypoint_tolerance_;
+        double tol = is_final ? 0.05 : waypoint_tolerance_;
         std::snprintf(buf, sizeof(buf), " | target=(%.2f,%.2f) | dist=%.2fm",
                       wp.pose.position.x, wp.pose.position.y, dist);
         s << buf;
