@@ -12,3 +12,6 @@ __pycache__/
 CMakeCache.txt
 .vscode/
 *.png
+results/**/*.mcap
+results/**/*.db3
+results/gazebo_*_bag/
