@@ -238,6 +238,12 @@ private:
         std::vector<double> ranges(4);
         for (size_t i = 0; i < 4; ++i) ranges[i] = static_cast<double>(msg->ranges[i]);
 
+        // Stage 2: feed every scan into the line extractor BEFORE the
+        // translation gate. The gate exists to throttle the expensive
+        // scan-to-map nearest-cell search; the buffered extractor is cheap
+        // and needs every sample so its world-bearing buckets fill in.
+        runLineExtractorDebug(ranges, bearings);
+
         Eigen::Vector4d cur_pose = ekf_->getPose();
 
         double trans_dist = std::hypot(cur_pose(0) - prev_scan_pose_(0),
@@ -265,11 +271,6 @@ private:
 
         prev_scan_pose_ = ekf_->getPose();
         prev_scan_pose_set_ = true;
-
-        // Stage 2 (debug-only): feed the line extractor with the latest scan
-        // and publish detected lines/corners. EKF state is NOT updated from
-        // these observations yet — that's Stage 3/4.
-        runLineExtractorDebug(ranges, bearings);
     }
 
     void runLineExtractorDebug(const std::vector<double>& ranges,
@@ -285,10 +286,6 @@ private:
 
         publishLineMarkers(lines);
         publishCornerMarkers(corners);
-
-        RCLCPP_DEBUG(this->get_logger(),
-            "line_extractor: %zu lines, %zu corners",
-            lines.size(), corners.size());
     }
 
     void publishLineMarkers(const std::vector<ekf_slam::LineObs>& lines) {

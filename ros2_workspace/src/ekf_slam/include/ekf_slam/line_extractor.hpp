@@ -86,6 +86,23 @@ public:
 
     const Params& params() const { return params_; }
 
+    /// Read-only access for debug printing: returns {bucket_deg -> point_count}.
+    std::map<int, size_t> bucketSizes() const {
+        std::map<int, size_t> out;
+        for (const auto& kv : buckets_) out[kv.first] = kv.second.size();
+        return out;
+    }
+
+    /// Total number of endpoints currently buffered across all buckets.
+    size_t totalEndpoints() const {
+        size_t n = 0;
+        for (const auto& kv : buckets_) n += kv.second.size();
+        return n;
+    }
+
+    /// Latest scan sequence number (monotonically increases by 1 per addScan).
+    double seq() const { return seq_; }
+
 private:
     struct Endpoint {
         double wx;     ///< world x
