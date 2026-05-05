@@ -271,6 +271,12 @@ private:
             if (sm.valid) {
                 ekf_->updateScanMatch(sm.dx, sm.dy, sm.dtheta, sm.match_quality);
                 ran_scan_to_map = true;
+                if (!scan_to_map_initialized_) {
+                    scan_to_map_initialized_ = true;
+                    RCLCPP_INFO(this->get_logger(),
+                        "[init] scan-to-map first success — line landmark "
+                        "augment/update enabled from this scan onward.");
+                }
                 RCLCPP_DEBUG(this->get_logger(),
                     "scan-to-map abs=(%.3f, %.3f, %.3f) q=%.3f",
                     sm.dx, sm.dy, sm.dtheta, sm.match_quality);
@@ -333,6 +339,12 @@ private:
     static constexpr double CONFIRM_THETA_TOL = 0.10;  // rad
     static constexpr int    CANDIDATE_TTL    = 30;    // scans without re-obs before forget
 
+    // Robot-frame rho bounds. Below RHO_MIN are near-origin garbage fits;
+    // above RHO_MAX are outside the room and almost certainly extractor
+    // noise (e.g. from a single bucket with two beam endpoints far apart).
+    static constexpr double RHO_MIN_M = 0.15;
+    static constexpr double RHO_MAX_M = 2.5;
+
     struct LineCandidate {
         double rho;
         double theta;
@@ -345,6 +357,11 @@ private:
     /// update if matched. If unmatched, route through the confirmation buffer
     /// and only augment once we have N_CONFIRM consistent observations.
     void runLineSlamUpdate(const std::vector<ekf_slam::LineObs>& lines) {
+        // Hard gate: do not touch the landmark state until scan-to-map has
+        // anchored the pose at least once. Otherwise the first scans run
+        // against an uninitialized pose and seed the EKF with garbage.
+        if (!scan_to_map_initialized_) return;
+
         // Per-scan diagnostic throttle (~1 Hz).
         bool diag_this_scan = false;
         double now_s = this->now().seconds();
@@ -357,6 +374,18 @@ private:
             const auto& obs        = lines[obs_i];
             const double rho_obs   = obs.rho;
             const double theta_obs = obs.theta;
+
+            // Robot-frame rho bounds: drop near-origin and out-of-room fits.
+            if (std::abs(rho_obs) < RHO_MIN_M ||
+                std::abs(rho_obs) > RHO_MAX_M) {
+                if (diag_this_scan && obs_i == 0) {
+                    RCLCPP_INFO(this->get_logger(),
+                        "[DA] obs=(rho=%.3f th=%.3f) REJECTED by rho gate "
+                        "[%.2f, %.2f]m",
+                        rho_obs, theta_obs, RHO_MIN_M, RHO_MAX_M);
+                }
+                continue;
+            }
 
             const int n_lm   = ekf_->nLandmarks2();
             int   best_j     = -1;
@@ -684,6 +713,10 @@ private:
 
     // One-shot diagnostic for the K-dim verification log.
     bool logged_first_update_ = false;
+
+    // Latch: line landmark augment/update is gated until the first time
+    // scan-to-map successfully runs and corrects the pose.
+    bool scan_to_map_initialized_ = false;
 
     // Scan counter (for confirmation-buffer TTL and start-of-flight diag).
     unsigned long scans_seen_ = 0;
