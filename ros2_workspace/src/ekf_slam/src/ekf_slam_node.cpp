@@ -5,6 +5,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -12,6 +13,7 @@
 #include <Eigen/Dense>
 
 #include "ekf_slam/ekf_core.hpp"
+#include "ekf_slam/line_extractor.hpp"
 
 #include <cmath>
 #include <limits>
@@ -58,6 +60,10 @@ public:
             "/ekf_pose", 10);
         pose_cov_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
             "/ekf_covariance", 10);
+        lines_dbg_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/ekf_slam/debug/lines", 10);
+        corners_dbg_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/ekf_slam/debug/corners", 10);
 
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(100),
@@ -259,6 +265,103 @@ private:
 
         prev_scan_pose_ = ekf_->getPose();
         prev_scan_pose_set_ = true;
+
+        // Stage 2 (debug-only): feed the line extractor with the latest scan
+        // and publish detected lines/corners. EKF state is NOT updated from
+        // these observations yet — that's Stage 3/4.
+        runLineExtractorDebug(ranges, bearings);
+    }
+
+    void runLineExtractorDebug(const std::vector<double>& ranges,
+                               const double bearings[4]) {
+        Eigen::Vector4d pose = ekf_->getPose();
+        std::array<double, 4> r_arr = {ranges[0], ranges[1], ranges[2], ranges[3]};
+        std::array<double, 4> b_arr = {bearings[0], bearings[1], bearings[2], bearings[3]};
+        line_extractor_.addScan(pose(0), pose(1), pose(3), r_arr, b_arr);
+
+        std::vector<ekf_slam::LineObs>   lines;
+        std::vector<ekf_slam::CornerObs> corners;
+        line_extractor_.extract(pose(0), pose(1), pose(3), lines, corners);
+
+        publishLineMarkers(lines);
+        publishCornerMarkers(corners);
+
+        RCLCPP_DEBUG(this->get_logger(),
+            "line_extractor: %zu lines, %zu corners",
+            lines.size(), corners.size());
+    }
+
+    void publishLineMarkers(const std::vector<ekf_slam::LineObs>& lines) {
+        visualization_msgs::msg::MarkerArray arr;
+        // Always publish a DELETEALL first so stale segments disappear.
+        visualization_msgs::msg::Marker del;
+        del.header.frame_id = "map";
+        del.header.stamp    = this->now();
+        del.action          = visualization_msgs::msg::Marker::DELETEALL;
+        arr.markers.push_back(del);
+
+        int id = 0;
+        for (const auto& lo : lines) {
+            visualization_msgs::msg::Marker m;
+            m.header.frame_id    = "map";
+            m.header.stamp       = this->now();
+            m.ns                 = "ekf_slam_lines";
+            m.id                 = id++;
+            m.type               = visualization_msgs::msg::Marker::LINE_STRIP;
+            m.action             = visualization_msgs::msg::Marker::ADD;
+            m.scale.x            = 0.02;
+            m.color.r            = 0.1f;
+            m.color.g            = 0.9f;
+            m.color.b            = 0.2f;
+            m.color.a            = 1.0f;
+            m.pose.orientation.w = 1.0;
+
+            // Draw a 2 m segment centred at the closest point on the line.
+            double cx_w = lo.rho_w * std::cos(lo.theta_w);
+            double cy_w = lo.rho_w * std::sin(lo.theta_w);
+            double tx   = -std::sin(lo.theta_w);
+            double ty   =  std::cos(lo.theta_w);
+            geometry_msgs::msg::Point p1, p2;
+            p1.x = cx_w - tx; p1.y = cy_w - ty; p1.z = 0.0;
+            p2.x = cx_w + tx; p2.y = cy_w + ty; p2.z = 0.0;
+            m.points.push_back(p1);
+            m.points.push_back(p2);
+            arr.markers.push_back(m);
+        }
+        lines_dbg_pub_->publish(arr);
+    }
+
+    void publishCornerMarkers(const std::vector<ekf_slam::CornerObs>& corners) {
+        visualization_msgs::msg::MarkerArray arr;
+        visualization_msgs::msg::Marker del;
+        del.header.frame_id = "map";
+        del.header.stamp    = this->now();
+        del.action          = visualization_msgs::msg::Marker::DELETEALL;
+        arr.markers.push_back(del);
+
+        int id = 0;
+        for (const auto& co : corners) {
+            visualization_msgs::msg::Marker m;
+            m.header.frame_id    = "map";
+            m.header.stamp       = this->now();
+            m.ns                 = "ekf_slam_corners";
+            m.id                 = id++;
+            m.type               = visualization_msgs::msg::Marker::SPHERE;
+            m.action             = visualization_msgs::msg::Marker::ADD;
+            m.pose.position.x    = co.xw;
+            m.pose.position.y    = co.yw;
+            m.pose.position.z    = 0.0;
+            m.pose.orientation.w = 1.0;
+            m.scale.x            = 0.10;
+            m.scale.y            = 0.10;
+            m.scale.z            = 0.10;
+            m.color.r            = 0.95f;
+            m.color.g            = 0.4f;
+            m.color.b            = 0.1f;
+            m.color.a            = 1.0f;
+            arr.markers.push_back(m);
+        }
+        corners_dbg_pub_->publish(arr);
     }
 
     void publishPose() {
@@ -317,7 +420,11 @@ private:
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr   map_sub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr   pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_cov_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr lines_dbg_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr corners_dbg_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
+
+    ekf_slam::LineExtractor line_extractor_;
 
     double          last_odom_time_;
     Eigen::Vector4d prev_scan_pose_;

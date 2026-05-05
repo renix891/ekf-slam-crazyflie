@@ -13,6 +13,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
@@ -27,6 +28,7 @@ include_directories(
 # EKF core library
 add_library(ekf_core
   src/ekf_core.cpp
+  src/line_extractor.cpp
 )
 
 target_include_directories(ekf_core PUBLIC
@@ -54,6 +56,7 @@ ament_target_dependencies(ekf_slam_node
   nav_msgs
   geometry_msgs
   std_msgs
+  visualization_msgs
   tf2
   tf2_geometry_msgs
   Eigen3
