@@ -260,8 +260,14 @@ private:
         double trans_dist = std::hypot(cur_pose(0) - prev_scan_pose_(0),
                                        cur_pose(1) - prev_scan_pose_(1));
         bool ran_scan_to_map = false;
+        bool gate_passed     = false;
+        bool sm_valid        = false;
+        double sm_quality    = 0.0;
         if (!prev_scan_pose_set_ || trans_dist >= 0.02) {
+            gate_passed = true;
             ScanMatchResult sm = scanToMapMatch(ranges, bearings);
+            sm_valid    = sm.valid;
+            sm_quality  = sm.match_quality;
             if (sm.valid) {
                 ekf_->updateScanMatch(sm.dx, sm.dy, sm.dtheta, sm.match_quality);
                 ran_scan_to_map = true;
@@ -272,6 +278,31 @@ private:
             prev_scan_pose_     = ekf_->getPose();
             prev_scan_pose_set_ = true;
         }
+
+        // First-N diagnostic so we can tell whether scan2map=skipped means
+        // (a) translation gate held, (b) gate passed but no map / not enough
+        // occupied cells / not enough valid beams, or (c) map sub never fired.
+        if (scans_seen_ < 5) {
+            int occupied = 0;
+            {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                if (current_map_) {
+                    for (auto& cell : current_map_->data) if (cell == 100) occupied++;
+                }
+            }
+            RCLCPP_INFO(this->get_logger(),
+                "[scanCB diag #%lu] map_received=%d occupied_cells=%d trans_dist=%.4fm "
+                "gate_passed=%d sm_valid=%d sm_q=%.2f ran_sm=%d",
+                scans_seen_,
+                static_cast<int>(map_received_),
+                occupied,
+                trans_dist,
+                static_cast<int>(gate_passed),
+                static_cast<int>(sm_valid),
+                sm_quality,
+                static_cast<int>(ran_scan_to_map));
+        }
+        scans_seen_++;
 
         // ADDITIONAL CORRECTION: line landmarks (true joint EKF-SLAM —
         // landmark update K is full-state-dim and correlates pose with all
@@ -293,19 +324,46 @@ private:
         logSlamState(lines, ran_scan_to_map);
     }
 
-    /// For each observed line: gate against existing landmarks; if the best
-    /// Mahalanobis distance falls below CHI2_GATE_2DOF, run an EKF update on
-    /// the matched landmark. Otherwise, augment a new landmark up to the cap.
+    // Confirmation buffer for new-landmark spawning. An observation is only
+    // augmented to the EKF state once we have seen N_CONFIRM matches within
+    // the confirm-gate of each other across distinct scans. Defends against
+    // transient front-end fits running away with the state.
+    static constexpr int    N_CONFIRM        = 3;
+    static constexpr double CONFIRM_RHO_TOL  = 0.10;  // m
+    static constexpr double CONFIRM_THETA_TOL = 0.10;  // rad
+    static constexpr int    CANDIDATE_TTL    = 30;    // scans without re-obs before forget
+
+    struct LineCandidate {
+        double rho;
+        double theta;
+        int    hits;
+        int    last_seen_scan;
+    };
+    std::vector<LineCandidate> line_candidates_;
+
+    /// For each observed line: Mahalanobis-gate against existing landmarks;
+    /// update if matched. If unmatched, route through the confirmation buffer
+    /// and only augment once we have N_CONFIRM consistent observations.
     void runLineSlamUpdate(const std::vector<ekf_slam::LineObs>& lines) {
-        for (const auto& obs : lines) {
+        // Per-scan diagnostic throttle (~1 Hz).
+        bool diag_this_scan = false;
+        double now_s = this->now().seconds();
+        if (now_s - last_diag_s_ >= 1.0) {
+            last_diag_s_   = now_s;
+            diag_this_scan = true;
+        }
+
+        for (size_t obs_i = 0; obs_i < lines.size(); ++obs_i) {
+            const auto& obs        = lines[obs_i];
             const double rho_obs   = obs.rho;
             const double theta_obs = obs.theta;
 
             const int n_lm   = ekf_->nLandmarks2();
             int   best_j     = -1;
             double best_d2   = std::numeric_limits<double>::infinity();
+            Eigen::Vector2d best_z_pred(0, 0);
+            Eigen::Vector2d best_nu(0, 0);
 
-            // Mahalanobis test against every existing line landmark.
             for (int k = 0; k < n_lm; ++k) {
                 int idx = 4 + 2 * k;
                 Eigen::Vector2d z_pred;
@@ -317,19 +375,36 @@ private:
                 Eigen::Matrix2d S = H * ekf_->getCovariance() * H.transpose() + Q_line_;
                 double d2 = nu.transpose() * S.inverse() * nu;
                 if (d2 < best_d2) {
-                    best_d2 = d2;
-                    best_j  = idx;
+                    best_d2     = d2;
+                    best_j      = idx;
+                    best_z_pred = z_pred;
+                    best_nu     = nu;
+                }
+            }
+
+            // Diagnostic: print first observation each scan so we can see why
+            // association is failing. Includes obs, predicted, innovation, d2.
+            if (diag_this_scan && obs_i == 0) {
+                if (best_j >= 0) {
+                    RCLCPP_INFO(this->get_logger(),
+                        "[DA] obs=(rho=%.3f th=%.3f) | nearest_lm idx=%d "
+                        "z_pred=(%.3f, %.3f) innov=(%.3f, %.3f) d2=%.2f "
+                        "(gate=%.2f) | n_lm=%d candidates=%zu",
+                        rho_obs, theta_obs, best_j,
+                        best_z_pred(0), best_z_pred(1),
+                        best_nu(0), best_nu(1), best_d2,
+                        CHI2_GATE_2DOF, n_lm, line_candidates_.size());
+                } else {
+                    RCLCPP_INFO(this->get_logger(),
+                        "[DA] obs=(rho=%.3f th=%.3f) | no existing landmarks | "
+                        "candidates=%zu",
+                        rho_obs, theta_obs, line_candidates_.size());
                 }
             }
 
             if (best_j >= 0 && best_d2 < CHI2_GATE_2DOF) {
                 ekf_->updateLineLandmark(best_j, rho_obs, theta_obs, Q_line_);
                 if (!logged_first_update_) {
-                    // One-shot dimension check: the Kalman gain in
-                    // updateLineLandmark is built as Sigma_ * H^T * S^-1, so K
-                    // is (stateDim x 2). mu_ += K * nu therefore corrects the
-                    // FULL state vector — pose, the matched landmark, and the
-                    // cross-covariance terms reach every other landmark.
                     int N = ekf_->stateDim();
                     RCLCPP_INFO(this->get_logger(),
                         "[verify] first line landmark update applied. "
@@ -339,9 +414,62 @@ private:
                     logged_first_update_ = true;
                 }
             } else if (n_lm < static_cast<int>(MAX_LINE_LANDMARKS)) {
-                ekf_->augmentLineFromObservation(rho_obs, theta_obs, Q_line_);
+                // Route through the confirmation buffer instead of augmenting
+                // straight into the state.
+                tryConfirmAndAugment(rho_obs, theta_obs);
             }
             // else: cap reached, no association — drop this observation.
+        }
+
+        // Age out stale candidates.
+        for (auto it = line_candidates_.begin(); it != line_candidates_.end();) {
+            if (scans_seen_ - it->last_seen_scan > CANDIDATE_TTL) {
+                it = line_candidates_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void tryConfirmAndAugment(double rho_obs, double theta_obs) {
+        // Find the nearest candidate within the confirm tolerance.
+        int best = -1;
+        double best_dist = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < line_candidates_.size(); ++i) {
+            double drho = std::abs(rho_obs - line_candidates_[i].rho);
+            double dth  = std::abs(ekf_slam::EKFCore::normalizeAngle(
+                              theta_obs - line_candidates_[i].theta));
+            if (drho < CONFIRM_RHO_TOL && dth < CONFIRM_THETA_TOL) {
+                double d = drho + dth;
+                if (d < best_dist) {
+                    best_dist = d;
+                    best      = static_cast<int>(i);
+                }
+            }
+        }
+        if (best < 0) {
+            // New candidate.
+            line_candidates_.push_back({rho_obs, theta_obs, 1,
+                                        static_cast<int>(scans_seen_)});
+            return;
+        }
+        // Existing candidate — refine running mean and bump hit count.
+        auto& c = line_candidates_[best];
+        // Don't double-count multiple obs in the same scan.
+        if (c.last_seen_scan == static_cast<int>(scans_seen_)) return;
+        c.hits           += 1;
+        c.last_seen_scan  = static_cast<int>(scans_seen_);
+        c.rho             = 0.5 * (c.rho + rho_obs);
+        c.theta           = 0.5 * (c.theta + ekf_slam::EKFCore::normalizeAngle(
+                                                  theta_obs));
+        if (c.hits >= N_CONFIRM) {
+            ekf_->augmentLineFromObservation(c.rho, c.theta, Q_line_);
+            RCLCPP_INFO(this->get_logger(),
+                "[augment] new line landmark: rho=%.3f theta=%.3f (after %d hits) | "
+                "n_lm=%d state_dim=%d",
+                c.rho, c.theta, c.hits,
+                ekf_->nLandmarks2(), ekf_->stateDim());
+            line_candidates_.erase(line_candidates_.begin() + best);
         }
     }
 
@@ -556,6 +684,11 @@ private:
 
     // One-shot diagnostic for the K-dim verification log.
     bool logged_first_update_ = false;
+
+    // Scan counter (for confirmation-buffer TTL and start-of-flight diag).
+    unsigned long scans_seen_ = 0;
+    // Throttle for the per-observation Mahalanobis diag (~1 Hz).
+    double last_diag_s_ = 0.0;
 };
 
 int main(int argc, char** argv) {
