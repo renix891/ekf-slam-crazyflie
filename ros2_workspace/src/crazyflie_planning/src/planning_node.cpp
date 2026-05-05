@@ -266,25 +266,11 @@ private:
         path_msg.header.stamp = this->now();
         path_msg.header.frame_id = occupancy_grid_msg_->header.frame_id;
 
-        // Skip leading waypoints within START_SKIP_RADIUS of the current pose so
-        // the navigator doesn't auto-complete a waypoint sitting on the start
-        // grid cell and burn its scan-timeout before any real motion occurs.
-        constexpr double START_SKIP_RADIUS = 0.15;
-        const double cur_x = current_pose_ ? current_pose_->pose.position.x : 0.0;
-        const double cur_y = current_pose_ ? current_pose_->pose.position.y : 0.0;
-        const bool have_pose = static_cast<bool>(current_pose_);
-
-        size_t start_idx = 0;
-        if (have_pose) {
-            for (; start_idx + 1 < path.size(); ++start_idx) {
-                auto [wx, wy] = gridToWorld(path[start_idx].first, path[start_idx].second);
-                if (std::hypot(wx - cur_x, wy - cur_y) >= START_SKIP_RADIUS) {
-                    break;
-                }
-            }
-        }
-
-        for (size_t i = start_idx; i < path.size(); ++i) {
+        // Publish every D* waypoint without any prefix filtering. The
+        // navigator's path_callback skips waypoints already inside its
+        // waypoint_tolerance, which handles the "start cell coincides with
+        // current pose" case without truncating tight avoidance turns.
+        for (size_t i = 0; i < path.size(); ++i) {
             auto [wx, wy] = gridToWorld(path[i].first, path[i].second);
 
             geometry_msgs::msg::PoseStamped ps;

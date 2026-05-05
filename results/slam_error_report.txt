@@ -1,0 +1,15 @@
+SLAM error report — EKF-corrected vs raw odometry
+
+Ground truth obstacle_4 centre: (0.40, 0.00) m, size 0.30 m
+Goal: (0.80, 0.00) m   Robot radius: 0.10 m
+
+  Metric                      EKF               Odom-Only         
+  ----------------------------------------------------------------
+  Obstacle surface RMS        0.012 m           0.008 m           
+    (n hits inside window)    434               3012              
+  Path efficiency ratio       1.70              3.41              
+    (path length)             1.36 m            2.73 m            
+  Time-fraction in C-obs      1.3%              4.9%              
+    (seconds inside)          1.0 s             18.2 s            
+  Time to goal                74.3 s            369.2 s           
+  Landing error               0.030 m           0.031 m           

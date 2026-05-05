@@ -71,12 +71,31 @@ void NavigationNode::pose_callback(const geometry_msgs::msg::PoseStamped::Shared
 
 void NavigationNode::path_callback(const nav_msgs::msg::Path::SharedPtr msg)
 {
-  if (!msg->poses.empty()) {
-    planned_path_ = msg->poses;
-    current_waypoint_idx_ = 0;
-    RCLCPP_DEBUG(this->get_logger(),
-      "Received path with %zu waypoints", msg->poses.size());
+  if (msg->poses.empty()) {
+    return;
   }
+  planned_path_ = msg->poses;
+  current_waypoint_idx_ = 0;
+
+  // Skip any leading waypoints already within waypoint_tolerance_ of the
+  // current pose. Without this the planner's first waypoint (start cell)
+  // would auto-complete into SCANNING and burn the scan-timeout. Stop one
+  // before the end so we never skip past the goal.
+  if (current_pose_) {
+    const double cx = current_pose_->pose.position.x;
+    const double cy = current_pose_->pose.position.y;
+    while (current_waypoint_idx_ + 1 < planned_path_.size()) {
+      const auto & wp = planned_path_[current_waypoint_idx_].pose.position;
+      if (std::hypot(wp.x - cx, wp.y - cy) >= waypoint_tolerance_) {
+        break;
+      }
+      current_waypoint_idx_++;
+    }
+  }
+
+  RCLCPP_DEBUG(this->get_logger(),
+    "Received path with %zu waypoints, starting at index %zu",
+    planned_path_.size(), current_waypoint_idx_);
 }
 
 void NavigationNode::enable_callback(

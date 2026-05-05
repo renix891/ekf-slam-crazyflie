@@ -32,6 +32,77 @@ ODOM_BAG = os.path.join(RESULTS_DIR, 'gazebo_full_nav_odom_only_bag')
 POSE_TOPIC = '/ekf_pose'
 GOAL = (0.8, 0.0)  # matches launch files
 
+# ---------------------------------------------------------------------------
+# C-space configuration (midterm Problem 3 / Part1.py style).
+# Crazyflie 2.x is ~92 mm motor-to-motor; round to a 100 mm body radius.
+# Inflate every static obstacle by this radius so the drone can be treated
+# as a dimensionless point — the standard Minkowski-sum trick.
+# Ground-truth obstacle list comes straight from crazyflie_world.sdf so this
+# stays in sync with what the simulator actually instantiates.
+# ---------------------------------------------------------------------------
+ROBOT_RADIUS = 0.10           # m, Crazyflie body half-diagonal
+CSPACE_RES = 0.05             # m, dot grid resolution
+CSPACE_BOUNDS = (-2.2, 2.2, -2.2, 2.2)  # x_min, x_max, y_min, y_max
+
+# Each entry: (xmin, xmax, ymin, ymax) in world coordinates BEFORE inflation.
+WORLD_OBSTACLES = [
+    # Outer walls (4 m x 4 m room, 0.1 m thick, centred on origin)
+    (1.95,  2.05, -2.05,  2.05),   # wall_east
+    (-2.05, -1.95, -2.05, 2.05),   # wall_west
+    (-2.05, 2.05,  1.95,  2.05),   # wall_north
+    (-2.05, 2.05, -2.05, -1.95),   # wall_south
+    # 0.2 x 0.2 columns at (0.5, 0.5), (-0.5, 0.3), (0.2, -0.6)
+    (0.4,  0.6,   0.4,  0.6),      # obstacle_1
+    (-0.6, -0.4,  0.2,  0.4),      # obstacle_2
+    (0.1,  0.3,  -0.7, -0.5),      # obstacle_3
+    # 0.3 x 0.3 stress-test box on the straight-line path to the landing pad
+    (0.25, 0.55, -0.15, 0.15),     # obstacle_4
+]
+
+
+def build_cspace_grid(obstacles, robot_radius, resolution, bounds):
+    """Return (free_xy, occ_xy) — Minkowski-inflated dot grid.
+
+    Mirrors WarehouseGraph.is_collision from MIDTERM/Problem 3/Part1.py:
+    inflate every rectangle by robot_radius, then classify each cell centre.
+    """
+    x_min, x_max, y_min, y_max = bounds
+    xs = np.arange(x_min, x_max + resolution, resolution)
+    ys = np.arange(y_min, y_max + resolution, resolution)
+    cx, cy = np.meshgrid(xs, ys)
+
+    occ_mask = np.zeros_like(cx, dtype=bool)
+    for (xmin, xmax, ymin, ymax) in obstacles:
+        # Distance from each cell centre to the rectangle (0 inside the rect).
+        dx = np.maximum.reduce([np.zeros_like(cx), xmin - cx, cx - xmax])
+        dy = np.maximum.reduce([np.zeros_like(cy), ymin - cy, cy - ymax])
+        d = np.hypot(dx, dy)
+        occ_mask |= (d <= robot_radius)
+
+    free_mask = ~occ_mask
+    free_xy = np.column_stack([cx[free_mask], cy[free_mask]])
+    occ_xy = np.column_stack([cx[occ_mask], cy[occ_mask]])
+    return free_xy, occ_xy
+
+
+def trajectory_clips(xs, ys, occ_xy, resolution):
+    """Return number of trajectory samples that fall inside an inflated cell.
+
+    Snaps each (x, y) sample to the nearest cell centre and checks set
+    membership against the occupied cells.
+    """
+    if len(xs) == 0 or occ_xy.size == 0:
+        return 0
+    # Quantise occupied cell centres to a hashable key (avoids float compare).
+    occ_keys = {(round(p[0] / resolution), round(p[1] / resolution))
+                for p in occ_xy}
+    hits = 0
+    for x, y in zip(xs, ys):
+        key = (round(x / resolution), round(y / resolution))
+        if key in occ_keys:
+            hits += 1
+    return hits
+
 
 def read_pose_xy(bag_path):
     """Return (times_s, xs, ys) for /ekf_pose in chronological order."""
@@ -136,28 +207,62 @@ def main():
     with open(os.path.join(RESULTS_DIR, 'nav_comparison_summary.txt'), 'w') as f:
         f.write(summary + '\n')
 
-    fig, ax = plt.subplots(figsize=(8, 8))
-    if len(ekf_x):
-        ax.plot(ekf_x, ekf_y, '-', color='C0', linewidth=1.5, label='EKF /ekf_pose')
-        ax.plot(ekf_x[0], ekf_y[0], 'o', color='C0', markersize=8, label='EKF start')
-        ax.plot(ekf_x[-1], ekf_y[-1], 's', color='C0', markersize=10, label='EKF final')
-    if len(odom_x):
-        ax.plot(odom_x, odom_y, '-', color='C3', linewidth=1.5, label='Odom-only /ekf_pose')
-        ax.plot(odom_x[0], odom_y[0], 'o', color='C3', markersize=8, label='Odom start')
-        ax.plot(odom_x[-1], odom_y[-1], 's', color='C3', markersize=10, label='Odom final')
-    ax.plot(GOAL[0], GOAL[1], '*', color='gold', markersize=20,
-            markeredgecolor='k', label=f'Goal ({GOAL[0]}, {GOAL[1]})')
+    free_xy, occ_xy = build_cspace_grid(
+        WORLD_OBSTACLES, ROBOT_RADIUS, CSPACE_RES, CSPACE_BOUNDS)
 
+    ekf_clips  = trajectory_clips(ekf_x,  ekf_y,  occ_xy, CSPACE_RES)
+    odom_clips = trajectory_clips(odom_x, odom_y, occ_xy, CSPACE_RES)
+
+    fig, ax = plt.subplots(figsize=(9, 9))
+
+    # Midterm Part1.visualize_c_space style: lightblue free dots, red obs dots.
+    ax.scatter(free_xy[:, 0], free_xy[:, 1], c='lightblue', s=5, zorder=1,
+               label='Free Space ($C_{free}$)')
+    ax.scatter(occ_xy[:, 0],  occ_xy[:, 1],  c='red',       s=5, zorder=2,
+               label='Inflated Obstacle Space ($C_{obs}$)')
+
+    if len(ekf_x):
+        ax.plot(ekf_x, ekf_y, '-', color='C0', linewidth=1.5, zorder=3,
+                label='EKF /ekf_pose')
+        ax.plot(ekf_x[0], ekf_y[0], 'o', color='C0', markersize=8, zorder=4,
+                label='EKF start')
+        ax.plot(ekf_x[-1], ekf_y[-1], 's', color='C0', markersize=10, zorder=4,
+                label='EKF final')
+    if len(odom_x):
+        ax.plot(odom_x, odom_y, '-', color='C3', linewidth=1.5, zorder=3,
+                label='Odom-only /ekf_pose')
+        ax.plot(odom_x[0], odom_y[0], 'o', color='C3', markersize=8, zorder=4,
+                label='Odom start')
+        ax.plot(odom_x[-1], odom_y[-1], 's', color='C3', markersize=10, zorder=4,
+                label='Odom final')
+    ax.plot(GOAL[0], GOAL[1], '*', color='gold', markersize=20,
+            markeredgecolor='k', zorder=5, label=f'Goal ({GOAL[0]}, {GOAL[1]})')
+
+    ax.set_xlim(CSPACE_BOUNDS[0], CSPACE_BOUNDS[1])
+    ax.set_ylim(CSPACE_BOUNDS[2], CSPACE_BOUNDS[3])
     ax.set_xlabel('x [m]')
     ax.set_ylabel('y [m]')
-    ax.set_aspect('equal', adjustable='datalim')
+    ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
-    ax.legend(loc='best', fontsize=9)
-    title = 'Autonomous navigation trajectories\nEKF-corrected vs raw odometry'
+    ax.legend(loc='upper right', fontsize=8)
+    title = ('Autonomous navigation trajectories on C-space\n'
+             f'(robot radius = {ROBOT_RADIUS:.2f} m, '
+             f'cell = {CSPACE_RES:.2f} m)')
     if not np.isnan(ekf_stats['goal_dist']) and not np.isnan(odom_stats['goal_dist']):
-        title += (f"\nLanding error — EKF: {ekf_stats['goal_dist']:.3f} m  | "
-                  f"Odom: {odom_stats['goal_dist']:.3f} m")
+        title += (f"\nLanding — EKF: {ekf_stats['goal_dist']:.3f} m  | "
+                  f"Odom: {odom_stats['goal_dist']:.3f} m   "
+                  f"|   Clips — EKF: {ekf_clips}  Odom: {odom_clips}")
     ax.set_title(title)
+
+    # Append clip counts to the on-disk summary too.
+    with open(os.path.join(RESULTS_DIR, 'nav_comparison_summary.txt'), 'a') as f:
+        f.write(
+            f"\nC-space clipping (robot_radius={ROBOT_RADIUS} m):\n"
+            f"  EKF  pose samples inside inflated obstacles: {ekf_clips} / {len(ekf_x)}\n"
+            f"  Odom pose samples inside inflated obstacles: {odom_clips} / {len(odom_x)}\n"
+        )
+    print(f"\nC-space clips — EKF: {ekf_clips}/{len(ekf_x)}  "
+          f"Odom: {odom_clips}/{len(odom_x)}")
     fig.tight_layout()
     out_png = os.path.join(RESULTS_DIR, 'nav_comparison_trajectories.png')
     fig.savefig(out_png, dpi=150)
