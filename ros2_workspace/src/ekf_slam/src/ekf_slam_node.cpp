@@ -432,8 +432,14 @@ private:
             }
 
             if (best_j >= 0 && best_d2 < CHI2_GATE_2DOF) {
-                ekf_->updateLineLandmark(best_j, rho_obs, theta_obs, Q_line_);
-                if (!logged_first_update_) {
+                bool applied = ekf_->updateLineLandmark(best_j, rho_obs, theta_obs, Q_line_);
+                if (!applied) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                        1000,
+                        "Line update skipped: S near-singular for landmark idx=%d "
+                        "(landmark covariance has shrunk too far). Filter held "
+                        "stable; will recover once Sigma grows.", best_j);
+                } else if (!logged_first_update_) {
                     int N = ekf_->stateDim();
                     RCLCPP_INFO(this->get_logger(),
                         "[verify] first line landmark update applied. "

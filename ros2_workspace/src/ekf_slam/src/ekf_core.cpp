@@ -158,18 +158,21 @@ int EKFCore::augment(const Eigen::VectorXd& new_state_block,
 int EKFCore::augmentLineFromObservation(double rho_obs_r, double theta_obs_r,
                                         const Eigen::Matrix2d& R_line) {
     // Inverse model: (rho_w, theta_w) from robot-frame observation.
+    //
+    // Storage convention: rho_w is signed. predictLineObservation also returns
+    // a signed rho_pred = rho_j - x*cos(theta_j) - y*sin(theta_j), so augment
+    // and predict are now consistent. An earlier version canonicalized rho_w
+    // >= 0 here, but did not adjust J_obs(0,0) for the sign flip — the
+    // resulting cross-covariance with the pose was wrong from the moment that
+    // landmark was added, and successive updates compounded the error until
+    // the filter teleported the pose tens of meters out of the room. Keeping
+    // the raw signed value avoids the non-smooth canonicalization entirely.
     const double x   = mu_(0);
     const double y   = mu_(1);
     const double psi = mu_(3);
 
     double theta_w = normalizeAngle(theta_obs_r + psi);
     double rho_w   = rho_obs_r + x * std::cos(theta_w) + y * std::sin(theta_w);
-
-    // Canonicalize: rho_w >= 0, normal points away from origin.
-    if (rho_w < 0.0) {
-        rho_w   = -rho_w;
-        theta_w = normalizeAngle(theta_w + M_PI);
-    }
 
     const int N = stateDim();
     Eigen::VectorXd new_block(2);
@@ -226,7 +229,7 @@ void EKFCore::predictLineObservation(int landmark_idx,
     H(1, landmark_idx + 1) = 1.0;
 }
 
-void EKFCore::updateLineLandmark(int landmark_idx,
+bool EKFCore::updateLineLandmark(int landmark_idx,
                                  double rho_obs_r, double theta_obs_r,
                                  const Eigen::Matrix2d& R_line) {
     const int N = stateDim();
@@ -239,6 +242,19 @@ void EKFCore::updateLineLandmark(int landmark_idx,
     nu(1) = normalizeAngle(theta_obs_r - z_pred(1));
 
     Eigen::Matrix2d S = H * Sigma_ * H.transpose() + R_line;
+
+    // Conditioning gate. After many updates against the same wall, the
+    // landmark covariance shrinks; if S becomes near-singular S^-1 explodes
+    // and K * nu produces a huge state jump (we observed pose teleporting
+    // tens of meters out of the room). Skip the update so the filter stays
+    // bounded; the rho/Mahalanobis gates upstream will still let later
+    // observations correct the pose once Sigma has grown again.
+    double det_S  = S.determinant();
+    double norm_S = S.norm();
+    if (!std::isfinite(det_S) || std::abs(det_S) < 1e-9 || norm_S < 1e-6) {
+        return false;
+    }
+
     Eigen::MatrixXd K = Sigma_ * H.transpose() * S.inverse();  // N x 2
 
     mu_ += K * nu;
@@ -252,6 +268,7 @@ void EKFCore::updateLineLandmark(int landmark_idx,
     }
 
     Sigma_ = (Eigen::MatrixXd::Identity(N, N) - K * H) * Sigma_;
+    return true;
 }
 
 Eigen::Vector4d EKFCore::getPose() const {

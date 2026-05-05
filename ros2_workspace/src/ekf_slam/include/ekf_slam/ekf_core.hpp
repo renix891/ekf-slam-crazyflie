@@ -69,10 +69,14 @@ public:
      * @brief EKF correction from a robot-frame line observation against an
      *        existing line landmark.
      *
+     * Skips the update if the innovation covariance S is near-singular
+     * (det(S) < 1e-9 or ||S|| < 1e-6). Returns true on a real update,
+     * false if the conditioning gate skipped it.
+     *
      * @param landmark_idx  Index returned by augmentLineFromObservation (or
      *                      derived from data association).
      */
-    void updateLineLandmark(int landmark_idx,
+    bool updateLineLandmark(int landmark_idx,
                             double rho_obs_r, double theta_obs_r,
                             const Eigen::Matrix2d& R_line);
 
