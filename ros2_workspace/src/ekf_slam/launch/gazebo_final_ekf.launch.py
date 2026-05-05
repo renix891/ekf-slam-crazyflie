@@ -40,9 +40,13 @@ HOVER_SCRIPT = os.path.join(
 ORCHESTRATOR_SCRIPT = os.path.join(
     PROJECT_DIR, 'ros2_workspace', 'src', 'ekf_slam', 'scripts',
     'mission_orchestrator.py')
+ODOM_TO_POSE_SCRIPT = os.path.join(
+    PROJECT_DIR, 'ros2_workspace', 'src', 'ekf_slam', 'scripts',
+    'odom_to_pose.py')
 BAG_DIR = os.path.join(PROJECT_DIR, 'results', 'final_ekf_bag')
 BAG_TOPICS = [
     '/crazyflie/odom',
+    '/crazyflie/odom_noisy',
     '/crazyflie/scan',
     '/ekf_pose',
     '/map',
@@ -96,11 +100,29 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
         output='screen')
 
+    # Inject hardware-grounded odom noise upstream of the EKF so the
+    # comparison against the odom-only baseline is "filter fights noise"
+    # rather than "clean data beats noisy data". Same σ as the odom-only
+    # launch — only the EKF's landmark-correction step differs.
+    noisy_odom = ExecuteProcess(
+        cmd=['python3', ODOM_TO_POSE_SCRIPT,
+             '--ros-args',
+             '-p', 'enable_noise:=true',
+             '-p', 'sigma_xy_per_s:=0.020',
+             '-p', 'sigma_yaw_per_s:=0.001',
+             # ekf_slam_node owns /ekf_pose in this run; suppress the
+             # republisher's /ekf_pose to avoid a two-publisher race.
+             '-p', 'publish_pose:=false'],
+        output='screen')
+
     ekf_slam = Node(
         package='ekf_slam',
         executable='ekf_slam_node',
         name='ekf_slam_node',
         parameters=[{'use_sim_time': use_sim_time}],
+        # Read the noisy odom stream produced by odom_to_pose.py instead
+        # of the clean simulator odom.
+        remappings=[('/crazyflie/odom', '/crazyflie/odom_noisy')],
         output='screen')
 
     planning = Node(
@@ -167,6 +189,9 @@ def generate_launch_description():
         clean_bag_dir,
         gz_sim,
         TimerAction(period=3.0, actions=[bridge, hover]),
+        # noisy_odom must come up before ekf_slam so the EKF's subscription
+        # to the remapped /crazyflie/odom_noisy has a publisher waiting.
+        TimerAction(period=4.0, actions=[noisy_odom]),
         TimerAction(period=5.0, actions=[mapper, ekf_slam, bag_record]),
         TimerAction(period=6.0, actions=[planning, navigation]),
         # Goal + nav-enable fire at t=12 so hover (~5 s) has fully released

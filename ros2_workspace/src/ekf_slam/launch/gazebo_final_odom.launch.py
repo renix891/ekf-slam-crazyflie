@@ -100,7 +100,9 @@ def generate_launch_description():
         cmd=['python3', ODOM_TO_POSE_SCRIPT,
              '--ros-args',
              '-p', 'enable_noise:=true',
-             '-p', 'sigma_xy_per_s:=0.003',
+             # Hardware-grounded noise: PMW3901 flow + VL53L1x ToF +
+             # BMI088 gyro. See odom_to_pose.py for derivation.
+             '-p', 'sigma_xy_per_s:=0.020',
              '-p', 'sigma_yaw_per_s:=0.001'],
         output='screen')
 
@@ -115,7 +117,24 @@ def generate_launch_description():
         package='crazyflie_navigation',
         executable='navigation_node',
         name='autonomous_navigation_node',
-        parameters=[{'use_sim_time': use_sim_time}],
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            # Odom-only baseline: skip per-waypoint SCANNING rotations.
+            # Scanning is an EKF-oriented behavior (rotate to feed the
+            # observation step with multi-bearing landmark hits); for the
+            # noisy-odom run we want pure point-to-point navigation so
+            # the comparison isolates pose-estimation accuracy.
+            'scanning_enabled': False,
+            # Halved from the 0.30 m/s default to keep bank angles within
+            # the Gazebo MulticopterVelocityControl plugin's altitude-
+            # tracking envelope. Without scan-spins between waypoints the
+            # drone otherwise sustains lateral commands long enough that
+            # the simulator drops altitude during the bank — a sim
+            # artifact, not a controller reality. The EKF run keeps 0.30
+            # because its periodic rotational scans give the controller
+            # implicit altitude-recovery windows.
+            'max_velocity': 0.15,
+        }],
         output='screen')
 
     hover = ExecuteProcess(

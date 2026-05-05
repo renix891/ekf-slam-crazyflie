@@ -27,15 +27,29 @@ class OdomToPose(Node):
     def __init__(self):
         super().__init__('odom_to_pose')
 
-        # Per-axis drift sigma in (units / sqrt(s)). Defaults match the final
-        # experiment spec: sigma_xy = 0.003 m per second cumulative,
-        # sigma_yaw = 0.001 rad per second cumulative.
+        # Per-axis drift sigma in (units / sqrt(s)). Defaults grounded in
+        # published Crazyflie 2.1 hardware specs:
+        #   sigma_xy = 0.020 m/√s — derived from PMW3901 optical-flow
+        #     measurement noise (2.0 px std, per Bitcraze firmware
+        #     kalman_core.c calibration) at 0.5 m hover with a 100 Hz
+        #     EKF update. Consistent with the ~25 cm Flow Deck dead-
+        #     reckoning drift observed over 2–3 min autonomous flights.
+        #   sigma_yaw = 0.001 rad/√s — lumped term covering BMI088 gyro
+        #     noise density (0.014°/s/√Hz, ≈2.4e-4 rad/√s pure white
+        #     noise) plus bias-instability and yaw–flow coupling that
+        #     Bitcraze warns dominates real Flow Deck yaw drift.
         self.sigma_xy_per_s   = self.declare_parameter(
-            'sigma_xy_per_s', 0.003).value
+            'sigma_xy_per_s', 0.020).value
         self.sigma_yaw_per_s  = self.declare_parameter(
             'sigma_yaw_per_s', 0.001).value
         self.enable_noise     = self.declare_parameter(
             'enable_noise', True).value
+        # When true (default), republish a noisy /ekf_pose so the
+        # odom-only baseline can use this node as its pose source.
+        # Set false in the EKF launch — there ekf_slam_node owns
+        # /ekf_pose and we only want the noisy /crazyflie/odom_noisy.
+        self.publish_pose     = self.declare_parameter(
+            'publish_pose', True).value
         self.seed             = self.declare_parameter('seed', -1).value
         if self.seed >= 0:
             self.rng = np.random.default_rng(int(self.seed))
@@ -48,7 +62,13 @@ class OdomToPose(Node):
         self.dyaw_drift = 0.0
         self.last_t = None
 
-        self.pub = self.create_publisher(PoseStamped, '/ekf_pose', 10)
+        self.pub = self.create_publisher(PoseStamped, '/ekf_pose', 10) if self.publish_pose else None
+        # Also republish a noisy nav_msgs/Odometry so the EKF (which reads
+        # velocity + yaw from /crazyflie/odom) can be wired to the same
+        # corrupted stream the odom-only baseline consumes. Lets the EKF
+        # vs odom-only comparison test "does the filter fight noise?"
+        # rather than the trivial "does clean data beat noisy data?".
+        self.odom_pub = self.create_publisher(Odometry, '/crazyflie/odom_noisy', 10)
         self.sub = self.create_subscription(
             Odometry, '/crazyflie/odom', self.cb, 10)
 
@@ -105,7 +125,28 @@ class OdomToPose(Node):
         else:
             ps.pose.orientation = msg.pose.pose.orientation
 
-        self.pub.publish(ps)
+        if self.pub is not None:
+            self.pub.publish(ps)
+
+        # Mirror the perturbations onto a full nav_msgs/Odometry. Velocity
+        # gets a per-sample white-noise perturbation σ_v = σ_xy / √dt so
+        # the integrated position drift in the EKF prediction step matches
+        # the position random walk above (σ_p(t) = σ_xy·√t for both).
+        odom_out = Odometry()
+        odom_out.header = msg.header
+        odom_out.child_frame_id = msg.child_frame_id
+        odom_out.pose.pose.position.x = msg.pose.pose.position.x + self.dx_drift
+        odom_out.pose.pose.position.y = msg.pose.pose.position.y + self.dy_drift
+        odom_out.pose.pose.position.z = msg.pose.pose.position.z
+        odom_out.pose.pose.orientation = ps.pose.orientation
+        odom_out.twist = msg.twist
+        if self.enable_noise and dt > 0.0:
+            sigma_v = self.sigma_xy_per_s / math.sqrt(dt)
+            sigma_w = self.sigma_yaw_per_s / math.sqrt(dt)
+            odom_out.twist.twist.linear.x  = msg.twist.twist.linear.x  + self.rng.normal(0.0, sigma_v)
+            odom_out.twist.twist.linear.y  = msg.twist.twist.linear.y  + self.rng.normal(0.0, sigma_v)
+            odom_out.twist.twist.angular.z = msg.twist.twist.angular.z + self.rng.normal(0.0, sigma_w)
+        self.odom_pub.publish(odom_out)
 
 
 def main():

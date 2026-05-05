@@ -34,7 +34,8 @@ GOAL_X    = 0.8
 GOAL_Y    = 0.0
 FLIGHT_Z  = 0.3
 TAKEOFF_Z = 0.20      # m, "we're up" threshold
-LAND_Z    = 0.05      # m, landing threshold (matches navigation_node)
+LAND_Z    = 0.08      # m, landing threshold (matches navigation_node).
+                      # 0.08 clears the 5 cm landing pad (top at z≈0.06).
 HOVER_S   = 2.0       # seconds to wait after first touchdown
 TICK_HZ   = 20.0      # bumped to 20Hz so the takeoff loop publishes /cmd_vel
                       # at the same rate gz_hover.py does
@@ -138,6 +139,13 @@ class MissionOrchestrator(Node):
                     "[orch] OUTBOUND landed at (%.3f, %.3f). "
                     "Hovering %.1fs before return leg." %
                     (self.cur_x, self.cur_y, HOVER_S))
+                # Force nav off on HOVER entry. Under clean odom/EKF, nav
+                # reaches the waypoint tolerance and self-disables before we
+                # see z<LAND_Z. Under noisy odom the drone can drop below
+                # LAND_Z without nav ever satisfying its tolerance, leaving
+                # nav's /cmd_vel publisher fighting this orchestrator.
+                self.call_set_bool(
+                    self.nav_client, False, 'enable_autonomous')
                 self.hover_started_at = self.get_clock().now()
                 self.state = 'HOVER'
 

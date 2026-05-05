@@ -28,6 +28,13 @@ NavigationNode::NavigationNode()
   max_velocity_ = this->declare_parameter<double>("max_velocity", 0.3);
   approach_distance_ = this->declare_parameter<double>("approach_distance", 0.1);
   approach_velocity_ = this->declare_parameter<double>("approach_velocity", 0.1);
+  // When false, intermediate waypoints skip the SCANNING rotation and
+  // advance directly to the next waypoint. The final-waypoint LANDING
+  // transition is unaffected. Used by the odom-only baseline so the
+  // comparison isolates pose-estimation accuracy under identical
+  // point-to-point navigation, without triggering EKF-oriented
+  // landmark-observation scans that aren't relevant to a noisy-odom run.
+  scanning_enabled_ = this->declare_parameter<bool>("scanning_enabled", true);
 
   // Subscribers — use EKF-corrected pose, not raw odometry
   pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -102,6 +109,7 @@ void NavigationNode::enable_callback(
   const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
   std::shared_ptr<std_srvs::srv::SetBool::Response> response)
 {
+  bool was_enabled = enabled_;
   enabled_ = request->data;
   response->success = true;
   response->message = std::string("Autonomous navigation ") +
@@ -109,6 +117,16 @@ void NavigationNode::enable_callback(
   RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
   if (!enabled_) {
     publish_zero_velocity();
+    current_waypoint_idx_ = 0;
+    waypoint_state_ = WaypointState::MOVING;
+    target_yaw_ = std::nullopt;
+    scan_started_at_ = std::nullopt;
+  } else if (!was_enabled) {
+    // Re-enable after a previous mission completed (LANDING → IDLE) means
+    // a new mission is starting — reset state and drop any stale path so
+    // the drone hovers until the new path arrives instead of re-running
+    // the previous LANDING descent at the previous goal.
+    planned_path_.clear();
     current_waypoint_idx_ = 0;
     waypoint_state_ = WaypointState::MOVING;
     target_yaw_ = std::nullopt;
@@ -211,6 +229,16 @@ void NavigationNode::control_loop()
         return;
       }
 
+      if (!scanning_enabled_) {
+        current_waypoint_idx_ += 1;
+        target_yaw_ = std::nullopt;
+        scan_started_at_ = std::nullopt;
+        RCLCPP_INFO(this->get_logger(),
+          "Waypoint %zu reached - scanning disabled, advancing to %zu",
+          current_waypoint_idx_ - 1, current_waypoint_idx_);
+        return;
+      }
+
       double current_yaw = quaternion_to_yaw(current_pose_->pose.orientation);
       target_yaw_ = normalize_angle(current_yaw + M_PI / 2.0);
       waypoint_state_ = WaypointState::SCANNING;
@@ -274,7 +302,10 @@ void NavigationNode::control_loop()
   } else if (waypoint_state_ == WaypointState::LANDING) {
     double current_z = current_pose_->pose.position.z;
 
-    if (current_z > 0.05) {
+    // 0.08 clears the 5 cm landing pad (top at z≈0.06) — at 0.05 the
+    // drone never reads below threshold when it lands ON the pad and
+    // sticks in LANDING forever publishing vz=-0.15.
+    if (current_z > 0.08) {
       geometry_msgs::msg::Twist cmd;
       cmd.linear.x = 0.0;
       cmd.linear.y = 0.0;

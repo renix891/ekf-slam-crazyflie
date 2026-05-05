@@ -57,6 +57,7 @@ private:
   double max_velocity_;
   double approach_distance_;
   double approach_velocity_;
+  bool scanning_enabled_;
 
   // State
   bool enabled_;

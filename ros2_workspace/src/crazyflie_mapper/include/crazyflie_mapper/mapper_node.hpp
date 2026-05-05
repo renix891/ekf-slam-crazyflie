@@ -36,17 +36,22 @@ private:
     double x, double y, double z, double w,
     double & roll, double & pitch, double & yaw);
   static std::vector<Cell> bresenham_line(int x0, int y0, int x1, int y1);
-  void apply_ray_weights(const std::vector<Cell> & ray_cells, int obstacle_distance_cells);
 
   // Parameters
-  double avoidance_distance_;
-  int max_avoidance_weight_;
   double max_obstacle_range_;
   double map_size_x_;
   double map_size_y_;
   double map_origin_x_;
   double map_origin_y_;
   double map_resolution_;
+  // Log-odds update parameters
+  float l_free_;          // increment per free observation (negative)
+  float l_occ_;           // increment per occupied observation (positive)
+  float l_min_;           // saturation floor
+  float l_max_;           // saturation ceiling
+  float p_occ_thresh_;    // probability above which a cell is published as 100
+  float p_free_thresh_;   // probability below which a cell is published as 0
+  int dilation_cells_;    // C-space inflation radius in cells
 
   // Derived map dimensions
   int map_width_;
@@ -59,7 +64,8 @@ private:
   double range_max_{3.5};
   bool position_update_{false};
 
-  std::vector<int8_t> map_;
+  // Persistent log-odds grid — accumulates across all scans, never reset.
+  std::vector<float> logodds_;
 
   // ROS interfaces
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
