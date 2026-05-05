@@ -177,7 +177,13 @@ private:
         for (auto& cell : current_map_->data) {
             if (cell == 100) occupied_count++;
         }
-        if (occupied_count < 50) return result;
+        // Threshold lowered from 50 to 15 — the original 50 was overly
+        // conservative for our small room: the 4-beam multiranger only marks
+        // a handful of cells per scan, so even a fully observed wall (~30
+        // cells) was being rejected. Live diagnostic showed flights stuck
+        // at occupied_count=33-34 forever, blocking scan-to-map and
+        // therefore also blocking the Stage-3 landmark init latch.
+        if (occupied_count < 15) return result;
 
         const double res = current_map_->info.resolution;
         const double ox  = current_map_->info.origin.position.x;
@@ -297,10 +303,16 @@ private:
             prev_scan_pose_set_ = true;
         }
 
-        // First-N diagnostic so we can tell whether scan2map=skipped means
+        // Periodic diagnostic so we can tell whether scan2map=skipped means
         // (a) translation gate held, (b) gate passed but no map / not enough
         // occupied cells / not enough valid beams, or (c) map sub never fired.
-        if (scans_seen_ < 5) {
+        // Fires for the first 5 scans, then once per second for the rest of
+        // the flight so we can watch the latch progression live.
+        double now_s = this->now().seconds();
+        bool fire_diag = (scans_seen_ < 5) ||
+                         (now_s - last_scan_diag_s_ >= 1.0);
+        if (fire_diag) {
+            last_scan_diag_s_ = now_s;
             int occupied = 0;
             {
                 std::lock_guard<std::mutex> lock(map_mutex_);
@@ -310,7 +322,7 @@ private:
             }
             RCLCPP_INFO(this->get_logger(),
                 "[scanCB diag #%lu] map_received=%d occupied_cells=%d trans_dist=%.4fm "
-                "gate_passed=%d sm_valid=%d sm_q=%.2f ran_sm=%d",
+                "gate_passed=%d sm_valid=%d sm_q=%.2f ran_sm=%d sm_init=%d",
                 scans_seen_,
                 static_cast<int>(map_received_),
                 occupied,
@@ -318,7 +330,8 @@ private:
                 static_cast<int>(gate_passed),
                 static_cast<int>(sm_valid),
                 sm_quality,
-                static_cast<int>(ran_scan_to_map));
+                static_cast<int>(ran_scan_to_map),
+                static_cast<int>(scan_to_map_initialized_));
         }
         scans_seen_++;
 
@@ -933,6 +946,8 @@ private:
     // Throttle for the per-observation Mahalanobis diag (~1 Hz).
     double last_diag_s_        = 0.0;
     double last_corner_diag_s_ = 0.0;
+    // Throttle for the scan-callback / scan-to-map state diag (~1 Hz).
+    double last_scan_diag_s_   = 0.0;
 };
 
 int main(int argc, char** argv) {
