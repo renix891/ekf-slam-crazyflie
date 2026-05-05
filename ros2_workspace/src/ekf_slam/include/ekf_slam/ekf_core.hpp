@@ -6,98 +6,75 @@
 namespace ekf_slam {
 
 /**
- * @brief EKF localization with scan-matching and altitude correction.
+ * @brief EKF localization core with a growable state vector.
  *
- * State vector: [x, y, z, theta]  (robot pose in world frame, 4x1)
+ * Pose layout (always the first 4 entries of mu_):
  *   index 0 = x      (m, world)
  *   index 1 = y      (m, world)
  *   index 2 = z      (m, world; AGL on real flow-deck flights)
  *   index 3 = theta  (rad, yaw)
  *
- * Motion model (predict): x, y use the existing body-frame planar model
- *   rotated by theta; z integrates world-frame vz directly; theta integrates
- *   omega.  z and theta are independent in the predict-step Jacobian.
- *
- * Corrections:
- *   - updateScanMatch: scan-to-map alignment yields an absolute world-frame
- *     (x, y) observation; theta passthrough comes from updateYaw, since the
- *     4-beam multiranger underconstrains rotation.  H is 3x4 picking rows
- *     0, 1, 3.
- *   - updateYaw: 1-D Kalman correction on theta from odom yaw.
- *   - updateZ:   1-D Kalman correction on z from a downward range source
- *     (Gazebo gpu_lidar / real CF flow-deck VL53L1x).  H = e_z.
+ * Landmarks are appended after the pose by augment().  The pose block math is
+ * unchanged from the fixed-size predecessor; updates expand their gain to
+ * full-state dimension so the cross-covariance with landmarks gets updated
+ * correctly once landmarks exist.
  */
 class EKFCore {
 public:
     EKFCore(const Eigen::Matrix4d& process_noise   = Eigen::Matrix4d::Identity() * 0.01,
             const Eigen::Matrix3d& scanmatch_noise = Eigen::Matrix3d::Identity() * 0.5);
 
-    /**
-     * @brief Predict step.
-     * @param vx body-frame x velocity (m/s)
-     * @param vy body-frame y velocity (m/s)
-     * @param vz world-frame z velocity (m/s) — matches both Gazebo
-     *           OdometryPublisher and the real CF flow-deck output for a
-     *           level-hovering quad.
-     * @param omega yaw rate (rad/s)
-     * @param dt seconds since previous predict
-     */
+    /// Predict step. Pose-only motion model; landmarks are static.
     void predict(double vx, double vy, double vz, double omega, double dt);
 
-    /**
-     * @brief EKF correction from scan matching.
-     *
-     * (dx, dy, dtheta) is interpreted as an absolute world-frame pose
-     * observation.  z is unobserved.
-     *
-     * @param match_quality scalar in (0, 1]; noise is scaled as Q/match_quality.
-     */
+    /// Scan-match correction (absolute world-frame x, y, theta observation).
     void updateScanMatch(double dx, double dy, double dtheta, double match_quality);
 
-    /**
-     * @brief Direct 1-D Kalman correction on theta from an external yaw source
-     *        (e.g. odometry quaternion).  H = e_theta.
-     */
+    /// 1-D Kalman correction on theta.
     void updateYaw(double yaw_meas, double yaw_noise = 0.01);
 
-    /**
-     * @brief Direct 1-D Kalman correction on z from a downward range source.
-     *        H = e_z.  No angle wrapping.  On real flight, z_meas comes from
-     *        the VL53L1x via /crazyflie/range/down — independent of the
-     *        firmware's pose.z, so the innovation is real.
-     */
+    /// 1-D Kalman correction on z from a downward range source.
     void updateZ(double z_meas, double z_noise = 0.01);
 
-    /**
-     * @brief Inform the EKF of the most recent commanded world-frame vz so
-     *        updateZ() can adapt its outlier gate. During takeoff/landing the
-     *        true innovation is large by design; during hover any large
-     *        innovation is almost certainly a bad range reading (e.g. the
-     *        down-beam struck a box on the floor).
-     */
+    /// Latest commanded vz; drives the updateZ outlier gate.
     void setCommandedVz(double vz);
 
-    Eigen::Vector4d  getPose() const;
-    Eigen::Matrix4d  getPoseCovariance() const;
-    const Eigen::Vector4d& getState() const      { return mu_; }
-    const Eigen::Matrix4d& getCovariance() const { return Sigma_; }
+    /**
+     * @brief Append a new landmark block to the state.
+     *
+     * @param new_state_block  k-vector of new state entries (e.g. [rho, theta] or [cx, cy]).
+     * @param new_block_cov    k x k covariance for the new block.
+     * @param cross_cov        k x stateDim() correlation between the new block and the
+     *                         existing state. Pass a zero matrix if uncorrelated.
+     * @return Index in mu_ at which the new block begins.
+     */
+    int augment(const Eigen::VectorXd& new_state_block,
+                const Eigen::MatrixXd& new_block_cov,
+                const Eigen::MatrixXd& cross_cov);
 
-    Eigen::Matrix2Xd previousScan_;
-    bool             hasPreviousScan_ = false;
+    Eigen::Vector4d  getPose() const;            // pose block (x, y, z, theta)
+    Eigen::Matrix4d  getPoseCovariance() const;  // top-left 4x4 of Sigma_
+
+    const Eigen::VectorXd& getState() const      { return mu_; }
+    const Eigen::MatrixXd& getCovariance() const { return Sigma_; }
+    Eigen::VectorXd&       mutableState()        { return mu_; }
+    Eigen::MatrixXd&       mutableCovariance()   { return Sigma_; }
+
+    int stateDim()    const { return static_cast<int>(mu_.size()); }
+    int nLandmarks2() const { return (stateDim() - 4) / 2; }  // # of 2-D landmark blocks
+
+    static double normalizeAngle(double angle);
 
 private:
-    Eigen::Vector4d mu_;
-    Eigen::Matrix4d Sigma_;
+    Eigen::VectorXd mu_;     // dim = 4 + sum(landmark_block_sizes)
+    Eigen::MatrixXd Sigma_;  // square, same dim as mu_
 
-    Eigen::Matrix4d R_;             // process noise (4x4)
-    Eigen::Matrix3d Q_scanmatch_;   // scan-match measurement noise over (x, y, theta)
+    Eigen::Matrix4d R_;            // pose-block process noise (4x4)
+    Eigen::Matrix3d Q_scanmatch_;  // (x, y, theta) scan-match noise
 
-    // Most recent commanded world-frame vz (m/s). Drives the updateZ outlier
-    // gate so it tightens during hover and relaxes during takeoff/landing.
     double commanded_vz_ = 0.0;
 
-    Eigen::Matrix4d computeG(double vx, double vy, double omega, double dt);
-    double normalizeAngle(double angle) const;
+    Eigen::Matrix4d computePoseJacobian(double vx, double vy, double dt) const;
 };
 
 }  // namespace ekf_slam

@@ -7,8 +7,8 @@ EKFCore::EKFCore(const Eigen::Matrix4d& process_noise,
                  const Eigen::Matrix3d& scanmatch_noise)
     : R_(process_noise),
       Q_scanmatch_(scanmatch_noise) {
-    mu_    = Eigen::Vector4d::Zero();
-    Sigma_ = Eigen::Matrix4d::Identity() * 0.1;
+    mu_    = Eigen::VectorXd::Zero(4);
+    Sigma_ = Eigen::MatrixXd::Identity(4, 4) * 0.1;
 }
 
 void EKFCore::predict(double vx, double vy, double vz, double omega, double dt) {
@@ -26,18 +26,33 @@ void EKFCore::predict(double vx, double vy, double vz, double omega, double dt) 
     mu_(2) += dz;
     mu_(3)  = normalizeAngle(mu_(3) + dtheta);
 
-    Eigen::Matrix4d G = computeG(vx, vy, omega, dt);
-    Sigma_ = G * Sigma_ * G.transpose() + R_;
+    // Landmarks are static; only the pose block has dynamics.
+    Eigen::Matrix4d G_pose = computePoseJacobian(vx, vy, dt);
+
+    const int N = stateDim();
+    if (N == 4) {
+        Sigma_ = G_pose * Sigma_ * G_pose.transpose() + R_;
+        return;
+    }
+
+    // Pose-pose block
+    Eigen::Matrix4d Sigma_pp = Sigma_.topLeftCorner<4, 4>();
+    Sigma_.topLeftCorner<4, 4>() = G_pose * Sigma_pp * G_pose.transpose() + R_;
+
+    // Pose-landmark cross blocks: G * Sigma_pl on the right, Sigma_lp * G^T on the left.
+    if (N > 4) {
+        Eigen::MatrixXd Sigma_pl = Sigma_.topRightCorner(4, N - 4);
+        Sigma_.topRightCorner(4, N - 4)    = G_pose * Sigma_pl;
+        Sigma_.bottomLeftCorner(N - 4, 4)  = Sigma_.topRightCorner(4, N - 4).transpose();
+    }
+    // Landmark-landmark block is left untouched (static landmarks, no process noise).
 }
 
-Eigen::Matrix4d EKFCore::computeG(double vx, double vy, double /*omega*/, double dt) {
+Eigen::Matrix4d EKFCore::computePoseJacobian(double vx, double vy, double dt) const {
     double theta = mu_(3);
     double cos_theta = std::cos(theta);
     double sin_theta = std::sin(theta);
 
-    // Only x and y rows pick up off-diagonals from rotating the body-frame
-    // velocity by theta.  z is independent of theta because vz is already
-    // world-frame; theta is independent of all positions.
     Eigen::Matrix4d G = Eigen::Matrix4d::Identity();
     G(0, 3) = (-vx * sin_theta - vy * cos_theta) * dt;
     G(1, 3) = ( vx * cos_theta - vy * sin_theta) * dt;
@@ -57,14 +72,14 @@ void EKFCore::updateScanMatch(double dx, double dy, double dtheta, double match_
 
     Eigen::Matrix3d Q = Q_scanmatch_ / (match_quality + 1e-6);
 
-    // 3x4 H: rows pick state indices 0 (x), 1 (y), 3 (theta).
-    Eigen::Matrix<double, 3, 4> H = Eigen::Matrix<double, 3, 4>::Zero();
+    const int N = stateDim();
+    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, N);
     H(0, 0) = 1.0;
     H(1, 1) = 1.0;
     H(2, 3) = 1.0;
 
-    Eigen::Matrix3d S = H * Sigma_ * H.transpose() + Q;
-    Eigen::Matrix<double, 4, 3> K = Sigma_ * H.transpose() * S.inverse();
+    Eigen::Matrix3d S   = H * Sigma_ * H.transpose() + Q;
+    Eigen::MatrixXd K   = Sigma_ * H.transpose() * S.inverse();  // N x 3
 
     Eigen::Vector3d nu;
     nu(0) = inno_x;
@@ -74,7 +89,7 @@ void EKFCore::updateScanMatch(double dx, double dy, double dtheta, double match_
     mu_    = mu_ + K * nu;
     mu_(3) = normalizeAngle(mu_(3));
 
-    Sigma_ = (Eigen::Matrix4d::Identity() - K * H) * Sigma_;
+    Sigma_ = (Eigen::MatrixXd::Identity(N, N) - K * H) * Sigma_;
 }
 
 void EKFCore::updateYaw(double yaw_meas, double yaw_noise) {
@@ -82,7 +97,8 @@ void EKFCore::updateYaw(double yaw_meas, double yaw_noise) {
     double S  = Sigma_(3, 3) + yaw_noise;
     if (S <= 0.0) return;
 
-    Eigen::Vector4d K = Sigma_.col(3) / S;
+    // Expanded gain: full N-vector picking out column 3, scaled by 1/S.
+    Eigen::VectorXd K = Sigma_.col(3) / S;
 
     mu_   += K * nu;
     mu_(3) = normalizeAngle(mu_(3));
@@ -93,20 +109,12 @@ void EKFCore::updateYaw(double yaw_meas, double yaw_noise) {
 void EKFCore::updateZ(double z_meas, double z_noise) {
     double nu = z_meas - mu_(2);
 
-    // Velocity-aware outlier gate. A downward-range innovation that's large
-    // is only a true outlier when the drone is *not* deliberately changing
-    // altitude — otherwise we'd reject takeoff/landing and freeze z.
     double threshold;
     if (mu_(2) < 0.1) {
-        // Near the ground (initialization or just after touchdown) — let
-        // any plausible reading in so z latches onto reality.
         threshold = 0.5;
     } else if (std::abs(commanded_vz_) > 0.05) {
-        // Active takeoff or landing: real innovations can be large.
         threshold = 0.4;
     } else {
-        // Hover: reject spikes that almost certainly came from the down-beam
-        // hitting an obstacle below the drone.
         threshold = 0.1;
     }
 
@@ -115,10 +123,8 @@ void EKFCore::updateZ(double z_meas, double z_noise) {
     double S  = Sigma_(2, 2) + z_noise;
     if (S <= 0.0) return;
 
-    Eigen::Vector4d K = Sigma_.col(2) / S;
-
+    Eigen::VectorXd K = Sigma_.col(2) / S;
     mu_ += K * nu;
-
     Sigma_ -= K * Sigma_.row(2);
 }
 
@@ -126,10 +132,38 @@ void EKFCore::setCommandedVz(double vz) {
     commanded_vz_ = vz;
 }
 
-Eigen::Vector4d EKFCore::getPose() const           { return mu_; }
-Eigen::Matrix4d EKFCore::getPoseCovariance() const { return Sigma_; }
+int EKFCore::augment(const Eigen::VectorXd& new_state_block,
+                     const Eigen::MatrixXd& new_block_cov,
+                     const Eigen::MatrixXd& cross_cov) {
+    const int N = stateDim();
+    const int k = static_cast<int>(new_state_block.size());
+    const int M = N + k;
 
-double EKFCore::normalizeAngle(double angle) const {
+    Eigen::VectorXd new_mu = Eigen::VectorXd::Zero(M);
+    new_mu.head(N) = mu_;
+    new_mu.tail(k) = new_state_block;
+
+    Eigen::MatrixXd new_Sigma = Eigen::MatrixXd::Zero(M, M);
+    new_Sigma.topLeftCorner(N, N)     = Sigma_;
+    new_Sigma.bottomRightCorner(k, k) = new_block_cov;
+    // cross_cov is (k x N): block ↔ existing state correlation.
+    new_Sigma.bottomLeftCorner(k, N)  = cross_cov;
+    new_Sigma.topRightCorner(N, k)    = cross_cov.transpose();
+
+    mu_    = std::move(new_mu);
+    Sigma_ = std::move(new_Sigma);
+    return N;  // index where the new block starts
+}
+
+Eigen::Vector4d EKFCore::getPose() const {
+    return mu_.head<4>();
+}
+
+Eigen::Matrix4d EKFCore::getPoseCovariance() const {
+    return Sigma_.topLeftCorner<4, 4>();
+}
+
+double EKFCore::normalizeAngle(double angle) {
     while (angle >  M_PI) angle -= 2.0 * M_PI;
     while (angle < -M_PI) angle += 2.0 * M_PI;
     return angle;
