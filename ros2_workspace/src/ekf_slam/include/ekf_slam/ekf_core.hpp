@@ -52,6 +52,39 @@ public:
                 const Eigen::MatrixXd& new_block_cov,
                 const Eigen::MatrixXd& cross_cov);
 
+    /**
+     * @brief Initialize a line landmark from a robot-frame observation.
+     *
+     * Inverts the (rho, theta) measurement model and appends the resulting
+     * (rho_w, theta_w) world-frame line to the state, computing the proper
+     * Jacobian-propagated cross-covariance with the existing pose so future
+     * observations can correct both pose and landmark consistently.
+     *
+     * @return Index in mu_ at which (rho_w, theta_w) begins (always even, >=4).
+     */
+    int augmentLineFromObservation(double rho_obs_r, double theta_obs_r,
+                                   const Eigen::Matrix2d& R_line);
+
+    /**
+     * @brief EKF correction from a robot-frame line observation against an
+     *        existing line landmark.
+     *
+     * @param landmark_idx  Index returned by augmentLineFromObservation (or
+     *                      derived from data association).
+     */
+    void updateLineLandmark(int landmark_idx,
+                            double rho_obs_r, double theta_obs_r,
+                            const Eigen::Matrix2d& R_line);
+
+    /**
+     * @brief Predicted robot-frame observation of an existing line landmark
+     *        and the (m x stateDim) measurement Jacobian. Used by data
+     *        association in the node.
+     */
+    void predictLineObservation(int landmark_idx,
+                                Eigen::Vector2d& z_pred,
+                                Eigen::MatrixXd& H) const;
+
     Eigen::Vector4d  getPose() const;            // pose block (x, y, z, theta)
     Eigen::Matrix4d  getPoseCovariance() const;  // top-left 4x4 of Sigma_
 

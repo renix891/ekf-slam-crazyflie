@@ -1,6 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -17,20 +16,25 @@
 
 #include <cmath>
 #include <limits>
-#include <mutex>
 #include <vector>
 
 class EKFSlamNode : public rclcpp::Node {
 public:
-    EKFSlamNode() : Node("ekf_slam_node"), last_odom_time_(0.0), prev_scan_pose_(Eigen::Vector4d::Zero()) {
+    EKFSlamNode() : Node("ekf_slam_node"), last_odom_time_(0.0) {
         Eigen::Matrix4d process_noise   = Eigen::Matrix4d::Identity() * 0.01;
+        // Scan-match noise param is no longer used; kept to preserve EKFCore
+        // ctor signature.
         Eigen::Matrix3d scanmatch_noise = Eigen::Matrix3d::Identity() * 0.5;
 
         ekf_ = std::make_unique<ekf_slam::EKFCore>(process_noise, scanmatch_noise);
 
-        RCLCPP_INFO(this->get_logger(),
-            "Q_scanmatch diag = (%.3f, %.3f, %.3f)",
-            scanmatch_noise(0, 0), scanmatch_noise(1, 1), scanmatch_noise(2, 2));
+        // Q_line: measurement noise for (rho, theta) line observations in robot frame.
+        // Diagonal-constant per Stage-2 line extractor spec, with a 2x inflation
+        // applied here so multi-bucket observations don't co-correct the pose
+        // beyond what the underlying point uncertainty justifies.
+        Q_line_ = Eigen::Matrix2d::Zero();
+        Q_line_(0, 0) = 0.04;   // 2 * 0.02
+        Q_line_(1, 1) = 0.02;   // 2 * 0.01
 
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/crazyflie/odom", 10,
@@ -52,10 +56,6 @@ public:
             "/cmd_vel", 10,
             std::bind(&EKFSlamNode::cmdVelCallback, this, std::placeholders::_1));
 
-        map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-            "/map", rclcpp::QoS(1).transient_local(),
-            std::bind(&EKFSlamNode::mapCallback, this, std::placeholders::_1));
-
         pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
             "/ekf_pose", 10);
         pose_cov_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -64,13 +64,16 @@ public:
             "/ekf_slam/debug/lines", 10);
         corners_dbg_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
             "/ekf_slam/debug/corners", 10);
+        landmark_lines_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/ekf_slam/debug/landmark_lines", 10);
 
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(100),
             std::bind(&EKFSlamNode::publishPose, this));
 
         RCLCPP_INFO(this->get_logger(),
-            "EKF-SLAM (4-D state: x, y, z, theta) initialized");
+            "EKF-SLAM landmark mode initialized (line landmarks; max %d)",
+            static_cast<int>(MAX_LINE_LANDMARKS));
     }
 
 private:
@@ -126,105 +129,8 @@ private:
         ekf_->updateZ(r, 0.05);
     }
 
-    void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        current_map_ = msg;
-        map_received_ = true;
-    }
-
-    struct ScanMatchResult {
-        double dx;            // absolute world-frame x observation
-        double dy;            // absolute world-frame y observation
-        double dtheta;        // absolute world-frame theta (from odom yaw)
-        double match_quality;
-        bool   valid;
-    };
-
-    // Scan-to-map match: for each beam endpoint, find nearest occupied cell in
-    // the map and accumulate the offset.  Rotation is taken from odometry yaw
-    // (4-beam multiranger doesn't give us enough constraints for rotational
-    // scan matching).
-    ScanMatchResult scanToMapMatch(const std::vector<double>& ranges,
-                                   const double bearings[4],
-                                   double /*dtheta_odom*/)
-    {
-        ScanMatchResult result{0.0, 0.0, 0.0, 0.0, false};
-
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        if (!map_received_ || !current_map_) return result;
-
-        int occupied_count = 0;
-        for (auto& cell : current_map_->data) {
-            if (cell == 100) occupied_count++;
-        }
-        if (occupied_count < 50) return result;
-
-        const double res = current_map_->info.resolution;
-        const double ox  = current_map_->info.origin.position.x;
-        const double oy  = current_map_->info.origin.position.y;
-        const int width  = static_cast<int>(current_map_->info.width);
-        const int height = static_cast<int>(current_map_->info.height);
-
-        Eigen::Vector4d pose = ekf_->getPose();
-        const double robot_x     = pose(0);
-        const double robot_y     = pose(1);
-        const double robot_theta = pose(3);
-
-        const int search_cells = static_cast<int>(0.5 / res);  // 0.5 m radius
-        const double accept_dist = 0.3;                        // m
-
-        double sum_dx = 0.0, sum_dy = 0.0;
-        double total_residual = 0.0;
-        int valid_beams = 0;
-
-        for (int i = 0; i < 4; ++i) {
-            double range = ranges[i];
-            if (!std::isfinite(range) || range < 0.01 || range > 3.49) continue;
-
-            double beam_angle_world = robot_theta + bearings[i];
-            double bx = robot_x + range * std::cos(beam_angle_world);
-            double by = robot_y + range * std::sin(beam_angle_world);
-
-            int cx = static_cast<int>((bx - ox) / res);
-            int cy = static_cast<int>((by - oy) / res);
-
-            double best_dist = std::numeric_limits<double>::infinity();
-            double best_wx = bx, best_wy = by;
-
-            for (int dy = -search_cells; dy <= search_cells; ++dy) {
-                for (int dx_cell = -search_cells; dx_cell <= search_cells; ++dx_cell) {
-                    int gx = cx + dx_cell;
-                    int gy = cy + dy;
-                    if (gx < 0 || gx >= width || gy < 0 || gy >= height) continue;
-                    int idx = gy * width + gx;
-                    if (current_map_->data[idx] == 100) {
-                        double dist = std::sqrt(static_cast<double>(dx_cell * dx_cell + dy * dy)) * res;
-                        if (dist < best_dist) {
-                            best_dist = dist;
-                            best_wx = ox + (gx + 0.5) * res;
-                            best_wy = oy + (gy + 0.5) * res;
-                        }
-                    }
-                }
-            }
-
-            if (best_dist < accept_dist) {
-                sum_dx += (best_wx - bx);
-                sum_dy += (best_wy - by);
-                total_residual += best_dist;
-                valid_beams++;
-            }
-        }
-
-        if (valid_beams < 2) return result;
-
-        result.dx = robot_x + sum_dx / valid_beams;
-        result.dy = robot_y + sum_dy / valid_beams;
-        result.dtheta = robot_theta;
-        result.match_quality = 1.0 / (1.0 + total_residual / valid_beams);
-        result.valid = true;
-        return result;
-    }
+    static constexpr size_t MAX_LINE_LANDMARKS = 20;
+    static constexpr double CHI2_GATE_2DOF     = 5.991;  // 95% threshold
 
     void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
         if (msg->ranges.size() != 4) {
@@ -238,43 +144,7 @@ private:
         std::vector<double> ranges(4);
         for (size_t i = 0; i < 4; ++i) ranges[i] = static_cast<double>(msg->ranges[i]);
 
-        // Stage 2: feed every scan into the line extractor BEFORE the
-        // translation gate. The gate exists to throttle the expensive
-        // scan-to-map nearest-cell search; the buffered extractor is cheap
-        // and needs every sample so its world-bearing buckets fill in.
-        runLineExtractorDebug(ranges, bearings);
-
-        Eigen::Vector4d cur_pose = ekf_->getPose();
-
-        double trans_dist = std::hypot(cur_pose(0) - prev_scan_pose_(0),
-                                       cur_pose(1) - prev_scan_pose_(1));
-        if (prev_scan_pose_set_ && trans_dist < 0.02) {
-            return;
-        }
-
-        double dtheta_odom = cur_pose(3) - prev_scan_pose_(3);
-        while (dtheta_odom >  M_PI) dtheta_odom -= 2.0 * M_PI;
-        while (dtheta_odom < -M_PI) dtheta_odom += 2.0 * M_PI;
-
-        ScanMatchResult sm = scanToMapMatch(ranges, bearings, dtheta_odom);
-        if (!sm.valid) {
-            prev_scan_pose_ = cur_pose;
-            prev_scan_pose_set_ = true;
-            return;
-        }
-
-        ekf_->updateScanMatch(sm.dx, sm.dy, sm.dtheta, sm.match_quality);
-
-        RCLCPP_DEBUG(this->get_logger(),
-            "scan-to-map abs=(%.3f, %.3f, %.3f) q=%.3f",
-            sm.dx, sm.dy, sm.dtheta, sm.match_quality);
-
-        prev_scan_pose_ = ekf_->getPose();
-        prev_scan_pose_set_ = true;
-    }
-
-    void runLineExtractorDebug(const std::vector<double>& ranges,
-                               const double bearings[4]) {
+        // Feed extractor with the latest scan (in current EKF pose's frame).
         Eigen::Vector4d pose = ekf_->getPose();
         std::array<double, 4> r_arr = {ranges[0], ranges[1], ranges[2], ranges[3]};
         std::array<double, 4> b_arr = {bearings[0], bearings[1], bearings[2], bearings[3]};
@@ -284,8 +154,56 @@ private:
         std::vector<ekf_slam::CornerObs> corners;
         line_extractor_.extract(pose(0), pose(1), pose(3), lines, corners);
 
+        // Raw extractor output (for RViz inspection of what the front-end sees).
         publishLineMarkers(lines);
         publishCornerMarkers(corners);
+
+        // Run SLAM data association + augment/update for each detected line.
+        runLineSlamUpdate(lines);
+
+        // Persisted state landmarks (post-update) for RViz inspection.
+        publishStateLandmarkLines();
+
+        // Per-scan log: landmark count, state dim, last line.
+        logSlamState(lines);
+    }
+
+    /// For each observed line: gate against existing landmarks; if the best
+    /// Mahalanobis distance falls below CHI2_GATE_2DOF, run an EKF update on
+    /// the matched landmark. Otherwise, augment a new landmark up to the cap.
+    void runLineSlamUpdate(const std::vector<ekf_slam::LineObs>& lines) {
+        for (const auto& obs : lines) {
+            const double rho_obs   = obs.rho;
+            const double theta_obs = obs.theta;
+
+            const int n_lm   = ekf_->nLandmarks2();
+            int   best_j     = -1;
+            double best_d2   = std::numeric_limits<double>::infinity();
+
+            // Mahalanobis test against every existing line landmark.
+            for (int k = 0; k < n_lm; ++k) {
+                int idx = 4 + 2 * k;
+                Eigen::Vector2d z_pred;
+                Eigen::MatrixXd H;
+                ekf_->predictLineObservation(idx, z_pred, H);
+                Eigen::Vector2d nu;
+                nu(0) = rho_obs - z_pred(0);
+                nu(1) = ekf_slam::EKFCore::normalizeAngle(theta_obs - z_pred(1));
+                Eigen::Matrix2d S = H * ekf_->getCovariance() * H.transpose() + Q_line_;
+                double d2 = nu.transpose() * S.inverse() * nu;
+                if (d2 < best_d2) {
+                    best_d2 = d2;
+                    best_j  = idx;
+                }
+            }
+
+            if (best_j >= 0 && best_d2 < CHI2_GATE_2DOF) {
+                ekf_->updateLineLandmark(best_j, rho_obs, theta_obs, Q_line_);
+            } else if (n_lm < static_cast<int>(MAX_LINE_LANDMARKS)) {
+                ekf_->augmentLineFromObservation(rho_obs, theta_obs, Q_line_);
+            }
+            // else: cap reached, no association — drop this observation.
+        }
     }
 
     void publishLineMarkers(const std::vector<ekf_slam::LineObs>& lines) {
@@ -361,6 +279,66 @@ private:
         corners_dbg_pub_->publish(arr);
     }
 
+    /// Render every persisted line landmark in the EKF state as a 2 m segment
+    /// in the world frame so RViz can show how the back-end's belief diverges
+    /// from raw extractor output.
+    void publishStateLandmarkLines() {
+        visualization_msgs::msg::MarkerArray arr;
+        visualization_msgs::msg::Marker del;
+        del.header.frame_id = "map";
+        del.header.stamp    = this->now();
+        del.action          = visualization_msgs::msg::Marker::DELETEALL;
+        arr.markers.push_back(del);
+
+        const Eigen::VectorXd& mu = ekf_->getState();
+        int n_lm = ekf_->nLandmarks2();
+        for (int k = 0; k < n_lm; ++k) {
+            int idx = 4 + 2 * k;
+            double rho_w   = mu(idx);
+            double theta_w = mu(idx + 1);
+
+            visualization_msgs::msg::Marker m;
+            m.header.frame_id    = "map";
+            m.header.stamp       = this->now();
+            m.ns                 = "ekf_slam_landmark_lines";
+            m.id                 = k;
+            m.type               = visualization_msgs::msg::Marker::LINE_STRIP;
+            m.action             = visualization_msgs::msg::Marker::ADD;
+            m.scale.x            = 0.03;
+            m.color.r            = 0.2f;
+            m.color.g            = 0.5f;
+            m.color.b            = 1.0f;
+            m.color.a            = 1.0f;
+            m.pose.orientation.w = 1.0;
+            double cx_w = rho_w * std::cos(theta_w);
+            double cy_w = rho_w * std::sin(theta_w);
+            double tx   = -std::sin(theta_w);
+            double ty   =  std::cos(theta_w);
+            geometry_msgs::msg::Point p1, p2;
+            p1.x = cx_w - tx; p1.y = cy_w - ty; p1.z = 0.0;
+            p2.x = cx_w + tx; p2.y = cy_w + ty; p2.z = 0.0;
+            m.points.push_back(p1);
+            m.points.push_back(p2);
+            arr.markers.push_back(m);
+        }
+        landmark_lines_pub_->publish(arr);
+    }
+
+    void logSlamState(const std::vector<ekf_slam::LineObs>& lines) {
+        int n_lm = ekf_->nLandmarks2();
+        int dim  = ekf_->stateDim();
+        if (lines.empty()) {
+            RCLCPP_INFO(this->get_logger(),
+                "Line landmarks: %d | State dim: %d | (no obs this scan)",
+                n_lm, dim);
+        } else {
+            const auto& last = lines.back();
+            RCLCPP_INFO(this->get_logger(),
+                "Line landmarks: %d | State dim: %d | Last obs: rho=%.3f theta=%.3f",
+                n_lm, dim, last.rho, last.theta);
+        }
+    }
+
     void publishPose() {
         Eigen::Vector4d pose     = ekf_->getPose();
         Eigen::Matrix4d pose_cov = ekf_->getPoseCovariance();
@@ -414,22 +392,17 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr    scan_sub_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr    down_range_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr      cmd_vel_sub_;
-    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr   map_sub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr   pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_cov_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr lines_dbg_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr corners_dbg_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr landmark_lines_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     ekf_slam::LineExtractor line_extractor_;
+    Eigen::Matrix2d         Q_line_;
 
-    double          last_odom_time_;
-    Eigen::Vector4d prev_scan_pose_;
-    bool            prev_scan_pose_set_ = false;
-
-    nav_msgs::msg::OccupancyGrid::SharedPtr current_map_;
-    bool                                    map_received_ = false;
-    std::mutex                              map_mutex_;
+    double last_odom_time_;
 };
 
 int main(int argc, char** argv) {

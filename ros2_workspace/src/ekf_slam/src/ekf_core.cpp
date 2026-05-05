@@ -155,6 +155,105 @@ int EKFCore::augment(const Eigen::VectorXd& new_state_block,
     return N;  // index where the new block starts
 }
 
+int EKFCore::augmentLineFromObservation(double rho_obs_r, double theta_obs_r,
+                                        const Eigen::Matrix2d& R_line) {
+    // Inverse model: (rho_w, theta_w) from robot-frame observation.
+    const double x   = mu_(0);
+    const double y   = mu_(1);
+    const double psi = mu_(3);
+
+    double theta_w = normalizeAngle(theta_obs_r + psi);
+    double rho_w   = rho_obs_r + x * std::cos(theta_w) + y * std::sin(theta_w);
+
+    // Canonicalize: rho_w >= 0, normal points away from origin.
+    if (rho_w < 0.0) {
+        rho_w   = -rho_w;
+        theta_w = normalizeAngle(theta_w + M_PI);
+    }
+
+    const int N = stateDim();
+    Eigen::VectorXd new_block(2);
+    new_block << rho_w, theta_w;
+
+    // J_pose = d(rho_w, theta_w) / d(x, y, z, psi). Only x, y, psi columns nonzero.
+    Eigen::MatrixXd J_pose = Eigen::MatrixXd::Zero(2, 4);
+    J_pose(0, 0) = std::cos(theta_w);
+    J_pose(0, 1) = std::sin(theta_w);
+    J_pose(0, 3) = -x * std::sin(theta_w) + y * std::cos(theta_w);
+    J_pose(1, 3) = 1.0;
+
+    // J_obs = d(rho_w, theta_w) / d(rho_obs_r, theta_obs_r).
+    Eigen::Matrix2d J_obs = Eigen::Matrix2d::Identity();
+    J_obs(0, 1) = -x * std::sin(theta_w) + y * std::cos(theta_w);
+
+    // New block covariance: pose-induced uncertainty + obs-induced uncertainty.
+    Eigen::Matrix4d Sigma_pose = Sigma_.topLeftCorner<4, 4>();
+    Eigen::Matrix2d new_block_cov =
+        J_pose * Sigma_pose * J_pose.transpose() +
+        J_obs  * R_line     * J_obs.transpose();
+
+    // Cross-covariance with the existing state: derivative w.r.t. each existing
+    // state column. Only the pose columns are non-zero (landmarks come in
+    // through the existing pose-landmark cross-covariances).
+    //   d new_block / d existing = J_pose * (rows 0..3 of Sigma_)
+    Eigen::MatrixXd cross_cov = Eigen::MatrixXd::Zero(2, N);
+    cross_cov = J_pose * Sigma_.topRows<4>();
+
+    return augment(new_block, new_block_cov, cross_cov);
+}
+
+void EKFCore::predictLineObservation(int landmark_idx,
+                                     Eigen::Vector2d& z_pred,
+                                     Eigen::MatrixXd& H) const {
+    const int N    = stateDim();
+    const double x   = mu_(0);
+    const double y   = mu_(1);
+    const double psi = mu_(3);
+    const double rho_j   = mu_(landmark_idx);
+    const double theta_j = mu_(landmark_idx + 1);
+
+    z_pred(0) = rho_j - x * std::cos(theta_j) - y * std::sin(theta_j);
+    z_pred(1) = normalizeAngle(theta_j - psi);
+
+    H = Eigen::MatrixXd::Zero(2, N);
+    // Pose columns
+    H(0, 0) = -std::cos(theta_j);
+    H(0, 1) = -std::sin(theta_j);
+    H(1, 3) = -1.0;
+    // Landmark columns
+    H(0, landmark_idx)     = 1.0;
+    H(0, landmark_idx + 1) = x * std::sin(theta_j) - y * std::cos(theta_j);
+    H(1, landmark_idx + 1) = 1.0;
+}
+
+void EKFCore::updateLineLandmark(int landmark_idx,
+                                 double rho_obs_r, double theta_obs_r,
+                                 const Eigen::Matrix2d& R_line) {
+    const int N = stateDim();
+    Eigen::Vector2d z_pred;
+    Eigen::MatrixXd H;
+    predictLineObservation(landmark_idx, z_pred, H);
+
+    Eigen::Vector2d nu;
+    nu(0) = rho_obs_r - z_pred(0);
+    nu(1) = normalizeAngle(theta_obs_r - z_pred(1));
+
+    Eigen::Matrix2d S = H * Sigma_ * H.transpose() + R_line;
+    Eigen::MatrixXd K = Sigma_ * H.transpose() * S.inverse();  // N x 2
+
+    mu_ += K * nu;
+    mu_(3) = normalizeAngle(mu_(3));
+    // Re-canonicalize each line landmark's theta.
+    for (int j = 4; j + 1 < N; j += 2) {
+        // Heuristic: lines come in pairs only if we ever interleave with corners,
+        // but Stage 3 only adds line blocks. Treat every (rho, theta) pair as a
+        // line and wrap theta. Stage 4 will switch on layout.
+        mu_(j + 1) = normalizeAngle(mu_(j + 1));
+    }
+
+    Sigma_ = (Eigen::MatrixXd::Identity(N, N) - K * H) * Sigma_;
+}
+
 Eigen::Vector4d EKFCore::getPose() const {
     return mu_.head<4>();
 }
