@@ -13,6 +13,7 @@
 #include <Eigen/Dense>
 
 #include "ekf_slam/ekf_core.hpp"
+#include "ekf_slam/landmark_filter.hpp"
 #include "ekf_slam/line_extractor.hpp"
 
 #include <cmath>
@@ -30,13 +31,19 @@ public:
 
         ekf_ = std::make_unique<ekf_slam::EKFCore>(process_noise, scanmatch_noise);
 
+        // Separate landmark filter — receives pose from EKFCore as a const
+        // input, never modifies pose. See landmark_filter.hpp for the
+        // architectural rationale.
+        landmark_filter_ = std::make_unique<ekf_slam::LandmarkFilter>();
+
         // Q_line: measurement noise for (rho, theta) line observations in robot frame.
-        // Diagonal-constant per Stage-2 line extractor spec, with a 2x inflation
-        // applied here so multi-bucket observations don't co-correct the pose
-        // beyond what the underlying point uncertainty justifies.
+        // Inflated heavily from the Stage-2 spec (diag(0.04, 0.02)) so the EKF
+        // trusts landmarks much less and the pose only gets nudged a little
+        // per update. Scan-to-map remains the dominant pose anchor; lines
+        // contribute correlation structure without dragging pose around.
         Q_line_ = Eigen::Matrix2d::Zero();
-        Q_line_(0, 0) = 0.04;   // 2 * 0.02
-        Q_line_(1, 1) = 0.02;   // 2 * 0.01
+        Q_line_(0, 0) = 0.5;
+        Q_line_(1, 1) = 0.2;
 
         // Q_corner: 2x the extractor's per-axis variance (0.04) for the same
         // reason — front-end noise is correlated across the simultaneous line
@@ -88,10 +95,10 @@ public:
             std::bind(&EKFSlamNode::publishPose, this));
 
         RCLCPP_INFO(this->get_logger(),
-            "EKF-SLAM hybrid initialized: scan-to-map primary + line landmarks "
-            "(max %d) + corner landmarks (max %d)",
-            static_cast<int>(MAX_LINE_LANDMARKS),
-            static_cast<int>(MAX_CORNER_LANDMARKS));
+            "EKF-SLAM two-filter init: 4-state pose EKF (scan-to-map + odom yaw + "
+            "down-range z) + separate LandmarkFilter for line landmarks "
+            "(max %d). Corners derived geometrically from line pairs.",
+            static_cast<int>(MAX_LINE_LANDMARKS));
     }
 
 private:
@@ -121,6 +128,7 @@ private:
 
     void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg) {
         ekf_->setCommandedVz(msg->linear.z);
+        last_cmd_vz_ = msg->linear.z;
     }
 
     void downRangeCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
@@ -177,13 +185,12 @@ private:
         for (auto& cell : current_map_->data) {
             if (cell == 100) occupied_count++;
         }
-        // Threshold lowered from 50 to 15 — the original 50 was overly
-        // conservative for our small room: the 4-beam multiranger only marks
-        // a handful of cells per scan, so even a fully observed wall (~30
-        // cells) was being rejected. Live diagnostic showed flights stuck
-        // at occupied_count=33-34 forever, blocking scan-to-map and
-        // therefore also blocking the Stage-3 landmark init latch.
-        if (occupied_count < 15) return result;
+        // Threshold reverted to v1's value (50). Lowering it to 15 made
+        // scan-to-map fire against a sparse map where nearest-occupied-cell
+        // matching is unreliable — the resulting (dx, dy) observations were
+        // noisy enough to drag pose around. Holding scan-to-map back until
+        // the map is dense matches v1's known-good 3.2 cm landing behavior.
+        if (occupied_count < 50) return result;
 
         const double res = current_map_->info.resolution;
         const double ox  = current_map_->info.origin.position.x;
@@ -244,8 +251,27 @@ private:
 
         if (valid_beams < 2) return result;
 
-        result.dx            = robot_x + sum_dx / valid_beams;
-        result.dy            = robot_y + sum_dy / valid_beams;
+        // Innovation clipping: cap the per-step correction magnitude so a
+        // single bad match (e.g. beam matched to a phantom cell from an
+        // earlier drifted pose) cannot snap the EKF pose by more than
+        // INNOVATION_CAP_M in one tick. With 2 beams frequently reading
+        // inf this is the standard robustness trick — keep scan-to-map
+        // firing every scan, but bound how much damage any one match can
+        // do. The EKF will need a few ticks to fully accept a real, large
+        // correction, but the cumulative effect is fine since scans are
+        // 10 Hz.
+        constexpr double INNOVATION_CAP_M = 0.08;
+        double corr_x = sum_dx / valid_beams;
+        double corr_y = sum_dy / valid_beams;
+        double corr_mag = std::hypot(corr_x, corr_y);
+        if (corr_mag > INNOVATION_CAP_M) {
+            double scale = INNOVATION_CAP_M / corr_mag;
+            corr_x *= scale;
+            corr_y *= scale;
+        }
+
+        result.dx            = robot_x + corr_x;
+        result.dy            = robot_y + corr_y;
         result.dtheta        = robot_theta;  // passthrough; yaw is corrected via updateYaw
         result.match_quality = 1.0 / (1.0 + total_residual / valid_beams);
         result.valid         = true;
@@ -272,6 +298,19 @@ private:
         std::array<double, 4> b_arr = {bearings[0], bearings[1], bearings[2], bearings[3]};
         line_extractor_.addScan(pre_pose(0), pre_pose(1), pre_pose(3), r_arr, b_arr);
 
+        // Descent gate: when nav has commanded descent (vz < -0.05) AND we're
+        // below 0.4 m, freeze all corrections — scan-to-map AND landmark
+        // updates. The EKF still runs the prediction step from /odom so z and
+        // yaw track, but xy stays locked at whatever it was when nav decided
+        // "goal reached" and entered LANDING. This eliminates the 5–10 cm
+        // sideways jitter during straight-down descent that was causing nav
+        // to overshoot the pad.
+        bool in_descent = (last_cmd_vz_ < -0.05) && (pre_pose(2) < 0.4);
+        if (in_descent) {
+            scans_seen_++;
+            return;
+        }
+
         // PRIMARY CORRECTION: scan-to-map. Same translation gate as before
         // Stage 3 — throttles the expensive nearest-occupied-cell search.
         Eigen::Vector4d cur_pose = ekf_->getPose();
@@ -295,9 +334,32 @@ private:
                         "[init] scan-to-map first success — line landmark "
                         "augment/update enabled from this scan onward.");
                 }
+                // Guard A: scan-to-map is anchoring the pose again. Reset the
+                // dropout counter and unpause landmarks if they were paused.
+                sm_failed_streak_ = 0;
+                if (landmarks_paused_) {
+                    landmarks_paused_ = false;
+                    RCLCPP_INFO(this->get_logger(),
+                        "[guard] scan-to-map recovered — landmark augment/update resumed.");
+                }
                 RCLCPP_DEBUG(this->get_logger(),
                     "scan-to-map abs=(%.3f, %.3f, %.3f) q=%.3f",
                     sm.dx, sm.dy, sm.dtheta, sm.match_quality);
+            } else if (scan_to_map_initialized_) {
+                // Guard A: scan-to-map was working, now it's not. Count
+                // consecutive failures; once we cross the threshold pause
+                // landmark augment/update so the cascade described in the
+                // last flight log can't happen (drift -> wrong-anchored
+                // augments -> failed DA -> spawn more wrong landmarks).
+                sm_failed_streak_++;
+                if (sm_failed_streak_ >= SM_DROPOUT_THRESHOLD && !landmarks_paused_) {
+                    landmarks_paused_ = true;
+                    RCLCPP_WARN(this->get_logger(),
+                        "[guard] scan-to-map dropped out for %d consecutive valid-gate "
+                        "scans — pausing landmark augment/update until it recovers. "
+                        "Predict-only EKF stays running.",
+                        sm_failed_streak_);
+                }
             }
             prev_scan_pose_     = ekf_->getPose();
             prev_scan_pose_set_ = true;
@@ -350,7 +412,10 @@ private:
         publishCornerMarkers(corners);
 
         runLineSlamUpdate(lines);
-        runCornerSlamUpdate(corners);
+        // Corner observations are no longer added to any filter state;
+        // corners are derived geometrically from the line landmarks at
+        // visualization time (see publishStateLandmarkCorners).
+        (void)corners;
 
         publishStateLandmarkLines();
         publishStateLandmarkCorners();
@@ -361,7 +426,7 @@ private:
     // augmented to the EKF state once we have seen N_CONFIRM matches within
     // the confirm-gate of each other across distinct scans. Defends against
     // transient front-end fits running away with the state.
-    static constexpr int    N_CONFIRM        = 3;
+    static constexpr int    N_CONFIRM        = 8;
     static constexpr double CONFIRM_RHO_TOL  = 0.10;  // m
     static constexpr double CONFIRM_THETA_TOL = 0.10;  // rad
     static constexpr int    CANDIDATE_TTL    = 30;    // scans without re-obs before forget
@@ -372,9 +437,20 @@ private:
     static constexpr double RHO_MIN_M = 0.15;
     static constexpr double RHO_MAX_M = 2.5;
 
+    // Guard B: room half-extent (the simulated room is roughly 4x4m centred
+    // on origin). Augment is rejected if the would-be world landmark is
+    // outside [-ROOM_HALF_M-ROOM_MARGIN_M, +ROOM_HALF_M+ROOM_MARGIN_M].
+    static constexpr double ROOM_HALF_M   = 2.0;
+    static constexpr double ROOM_MARGIN_M = 0.5;
+
     struct LineCandidate {
-        double rho;
-        double theta;
+        // Stored in WORLD frame. Robot-frame (rho_r, theta_r) shifts as the
+        // drone moves/yaws even when observing the same wall, so confirming
+        // in robot frame would never accumulate enough hits. Converting to
+        // world frame at observation time matches the corner candidate
+        // approach (which has always been world-frame).
+        double rho_w;
+        double theta_w;
         int    hits;
         int    last_seen_scan;
     };
@@ -384,10 +460,9 @@ private:
     /// update if matched. If unmatched, route through the confirmation buffer
     /// and only augment once we have N_CONFIRM consistent observations.
     void runLineSlamUpdate(const std::vector<ekf_slam::LineObs>& lines) {
-        // Hard gate: do not touch the landmark state until scan-to-map has
-        // anchored the pose at least once. Otherwise the first scans run
-        // against an uninitialized pose and seed the EKF with garbage.
-        if (!scan_to_map_initialized_) return;
+        // Two-filter architecture: landmark updates run on the separate
+        // LandmarkFilter and never touch the pose EKF. Pose comes in as a
+        // const input every scan.
 
         // Per-scan diagnostic throttle (~1 Hz).
         bool diag_this_scan = false;
@@ -396,6 +471,8 @@ private:
             last_diag_s_   = now_s;
             diag_this_scan = true;
         }
+
+        const Eigen::Vector4d pose = ekf_->getPose();
 
         for (size_t obs_i = 0; obs_i < lines.size(); ++obs_i) {
             const auto& obs        = lines[obs_i];
@@ -414,42 +491,42 @@ private:
                 continue;
             }
 
-            const int n_lm    = ekf_->nLandmarks2();
-            const int n_lines = ekf_->nLines();
-            int   best_j     = -1;
-            double best_d2   = std::numeric_limits<double>::infinity();
+            const int n_lm = landmark_filter_->nLandmarks();
+            int   best_k   = -1;
+            double best_d2 = std::numeric_limits<double>::infinity();
             Eigen::Vector2d best_z_pred(0, 0);
             Eigen::Vector2d best_nu(0, 0);
 
-            // DA: predict only against line landmarks. Skip corner blocks.
+            // DA over the landmark filter's covariance only — no coupling
+            // with pose covariance. H_lm is 2x2; S = H_lm * Sigma_block_kk
+            // * H_lm^T + Q_line.
+            const Eigen::MatrixXd& Sigma_lm = landmark_filter_->getCovariance();
             for (int k = 0; k < n_lm; ++k) {
-                if (ekf_->landmarkKind(k) != ekf_slam::LandmarkKind::Line) continue;
-                int idx = 4 + 2 * k;
                 Eigen::Vector2d z_pred;
-                Eigen::MatrixXd H;
-                ekf_->predictLineObservation(idx, z_pred, H);
+                Eigen::Matrix2d H_lm;
+                landmark_filter_->predictLineObservation(pose, k, z_pred, H_lm);
                 Eigen::Vector2d nu;
                 nu(0) = rho_obs - z_pred(0);
                 nu(1) = ekf_slam::EKFCore::normalizeAngle(theta_obs - z_pred(1));
-                Eigen::Matrix2d S = H * ekf_->getCovariance() * H.transpose() + Q_line_;
+                const int row = 2 * k;
+                Eigen::Matrix2d Sigma_kk = Sigma_lm.block<2, 2>(row, row);
+                Eigen::Matrix2d S = H_lm * Sigma_kk * H_lm.transpose() + Q_line_;
                 double d2 = nu.transpose() * S.inverse() * nu;
                 if (d2 < best_d2) {
                     best_d2     = d2;
-                    best_j      = idx;
+                    best_k      = k;
                     best_z_pred = z_pred;
                     best_nu     = nu;
                 }
             }
 
-            // Diagnostic: print first observation each scan so we can see why
-            // association is failing. Includes obs, predicted, innovation, d2.
             if (diag_this_scan && obs_i == 0) {
-                if (best_j >= 0) {
+                if (best_k >= 0) {
                     RCLCPP_INFO(this->get_logger(),
-                        "[DA] obs=(rho=%.3f th=%.3f) | nearest_lm idx=%d "
+                        "[DA] obs=(rho=%.3f th=%.3f) | nearest_lm k=%d "
                         "z_pred=(%.3f, %.3f) innov=(%.3f, %.3f) d2=%.2f "
                         "(gate=%.2f) | n_lm=%d candidates=%zu",
-                        rho_obs, theta_obs, best_j,
+                        rho_obs, theta_obs, best_k,
                         best_z_pred(0), best_z_pred(1),
                         best_nu(0), best_nu(1), best_d2,
                         CHI2_GATE_2DOF, n_lm, line_candidates_.size());
@@ -461,29 +538,26 @@ private:
                 }
             }
 
-            if (best_j >= 0 && best_d2 < CHI2_GATE_2DOF) {
-                bool applied = ekf_->updateLineLandmark(best_j, rho_obs, theta_obs, Q_line_);
+            if (best_k >= 0 && best_d2 < CHI2_GATE_2DOF) {
+                bool applied = landmark_filter_->updateLine(
+                    pose, best_k, rho_obs, theta_obs, Q_line_);
                 if (!applied) {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
                         1000,
-                        "Line update skipped: S near-singular for landmark idx=%d "
-                        "(landmark covariance has shrunk too far). Filter held "
-                        "stable; will recover once Sigma grows.", best_j);
+                        "Line update skipped: S near-singular for landmark k=%d "
+                        "(landmark covariance has shrunk too far).", best_k);
                 } else if (!logged_first_update_) {
-                    int N = ekf_->stateDim();
                     RCLCPP_INFO(this->get_logger(),
                         "[verify] first line landmark update applied. "
-                        "state dim = %d, Kalman gain K dim = %dx2 (full-state). "
-                        "True joint EKF-SLAM: pose and landmarks correlated.",
-                        N, N);
+                        "landmark state dim = %d. Pose EKF and landmark filter "
+                        "are independent — pose untouched by this update.",
+                        landmark_filter_->stateDim());
                     logged_first_update_ = true;
                 }
-            } else if (n_lines < static_cast<int>(MAX_LINE_LANDMARKS)) {
-                // Route through the confirmation buffer instead of augmenting
-                // straight into the state.
+            } else if (n_lm < static_cast<int>(MAX_LINE_LANDMARKS)) {
+                // Route through the confirmation buffer.
                 tryConfirmLineAndAugment(rho_obs, theta_obs);
             }
-            // else: line cap reached, no association — drop this observation.
         }
 
         // Age out stale candidates.
@@ -497,13 +571,22 @@ private:
     }
 
     void tryConfirmLineAndAugment(double rho_obs, double theta_obs) {
+        // Convert this scan's robot-frame observation into world frame so the
+        // candidate buffer can match across drone motion.
+        Eigen::Vector4d pose = ekf_->getPose();
+        double psi      = pose(3);
+        double theta_w  = ekf_slam::EKFCore::normalizeAngle(theta_obs + psi);
+        double rho_w    = rho_obs +
+                          pose(0) * std::cos(theta_w) +
+                          pose(1) * std::sin(theta_w);
+
         // Find the nearest candidate within the confirm tolerance.
         int best = -1;
         double best_dist = std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < line_candidates_.size(); ++i) {
-            double drho = std::abs(rho_obs - line_candidates_[i].rho);
+            double drho = std::abs(rho_w - line_candidates_[i].rho_w);
             double dth  = std::abs(ekf_slam::EKFCore::normalizeAngle(
-                              theta_obs - line_candidates_[i].theta));
+                              theta_w - line_candidates_[i].theta_w));
             if (drho < CONFIRM_RHO_TOL && dth < CONFIRM_THETA_TOL) {
                 double d = drho + dth;
                 if (d < best_dist) {
@@ -513,27 +596,41 @@ private:
             }
         }
         if (best < 0) {
-            // New candidate.
-            line_candidates_.push_back({rho_obs, theta_obs, 1,
+            line_candidates_.push_back({rho_w, theta_w, 1,
                                         static_cast<int>(scans_seen_)});
             return;
         }
-        // Existing candidate — refine running mean and bump hit count.
         auto& c = line_candidates_[best];
-        // Don't double-count multiple obs in the same scan.
         if (c.last_seen_scan == static_cast<int>(scans_seen_)) return;
-        c.hits           += 1;
-        c.last_seen_scan  = static_cast<int>(scans_seen_);
-        c.rho             = 0.5 * (c.rho + rho_obs);
-        c.theta           = 0.5 * (c.theta + ekf_slam::EKFCore::normalizeAngle(
-                                                  theta_obs));
+        c.hits          += 1;
+        c.last_seen_scan = static_cast<int>(scans_seen_);
+        c.rho_w          = 0.5 * (c.rho_w + rho_w);
+        c.theta_w        = 0.5 * (c.theta_w + theta_w);
         if (c.hits >= N_CONFIRM) {
-            ekf_->augmentLineFromObservation(c.rho, c.theta, Q_line_);
+            // Guard B: reject candidates whose world line is outside the
+            // simulated room.
+            if (std::abs(c.rho_w) > ROOM_HALF_M + ROOM_MARGIN_M) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                    "[guard] rejecting line candidate: |rho_w|=%.2f > %.2f "
+                    "(theta_w=%.2f)", std::abs(c.rho_w),
+                    ROOM_HALF_M + ROOM_MARGIN_M, c.theta_w);
+                line_candidates_.erase(line_candidates_.begin() + best);
+                return;
+            }
+            // Convert confirmed world line back to robot frame for the augment
+            // (augmentLine expects robot-frame inputs and the current pose).
+            Eigen::Vector4d aug_pose = ekf_->getPose();
+            double aug_psi    = aug_pose(3);
+            double rho_r_aug  = c.rho_w
+                                - aug_pose(0) * std::cos(c.theta_w)
+                                - aug_pose(1) * std::sin(c.theta_w);
+            double theta_r_aug = ekf_slam::EKFCore::normalizeAngle(c.theta_w - aug_psi);
+            landmark_filter_->augmentLine(aug_pose, rho_r_aug, theta_r_aug, Q_line_);
             RCLCPP_INFO(this->get_logger(),
-                "[augment] new line landmark: rho=%.3f theta=%.3f (after %d hits) | "
-                "n_lm=%d state_dim=%d",
-                c.rho, c.theta, c.hits,
-                ekf_->nLandmarks2(), ekf_->stateDim());
+                "[augment] new line landmark: world (rho=%.3f theta=%.3f) "
+                "(after %d hits) | n_lm=%d state_dim=%d",
+                c.rho_w, c.theta_w, c.hits,
+                landmark_filter_->nLandmarks(), landmark_filter_->stateDim());
             line_candidates_.erase(line_candidates_.begin() + best);
         }
     }
@@ -550,135 +647,9 @@ private:
     };
     std::vector<CornerCandidate> corner_candidates_;
 
-    void runCornerSlamUpdate(const std::vector<ekf_slam::CornerObs>& corners) {
-        if (!scan_to_map_initialized_) return;
-
-        bool diag_this_scan = false;
-        double now_s = this->now().seconds();
-        if (now_s - last_corner_diag_s_ >= 1.0) {
-            last_corner_diag_s_ = now_s;
-            diag_this_scan      = true;
-        }
-
-        for (size_t obs_i = 0; obs_i < corners.size(); ++obs_i) {
-            const auto& obs = corners[obs_i];
-            const double cx_obs = obs.x;
-            const double cy_obs = obs.y;
-
-            const int n_lm      = ekf_->nLandmarks2();
-            const int n_corners = ekf_->nCorners();
-            int   best_j   = -1;
-            double best_d2 = std::numeric_limits<double>::infinity();
-            Eigen::Vector2d best_z_pred(0, 0);
-            Eigen::Vector2d best_nu(0, 0);
-
-            for (int k = 0; k < n_lm; ++k) {
-                if (ekf_->landmarkKind(k) != ekf_slam::LandmarkKind::Corner) continue;
-                int idx = 4 + 2 * k;
-                Eigen::Vector2d z_pred;
-                Eigen::MatrixXd H;
-                ekf_->predictCornerObservation(idx, z_pred, H);
-                Eigen::Vector2d nu;
-                nu(0) = cx_obs - z_pred(0);
-                nu(1) = cy_obs - z_pred(1);
-                Eigen::Matrix2d S = H * ekf_->getCovariance() * H.transpose() + Q_corner_;
-                double d2 = nu.transpose() * S.inverse() * nu;
-                if (d2 < best_d2) {
-                    best_d2     = d2;
-                    best_j      = idx;
-                    best_z_pred = z_pred;
-                    best_nu     = nu;
-                }
-            }
-
-            if (diag_this_scan && obs_i == 0) {
-                if (best_j >= 0) {
-                    RCLCPP_INFO(this->get_logger(),
-                        "[DA-c] obs=(cx=%.3f cy=%.3f) | nearest_lm idx=%d "
-                        "z_pred=(%.3f, %.3f) innov=(%.3f, %.3f) d2=%.2f "
-                        "(gate=%.2f) | n_corners=%d candidates=%zu",
-                        cx_obs, cy_obs, best_j,
-                        best_z_pred(0), best_z_pred(1),
-                        best_nu(0), best_nu(1), best_d2,
-                        CHI2_GATE_2DOF, n_corners, corner_candidates_.size());
-                } else {
-                    RCLCPP_INFO(this->get_logger(),
-                        "[DA-c] obs=(cx=%.3f cy=%.3f) | no existing corners | "
-                        "candidates=%zu",
-                        cx_obs, cy_obs, corner_candidates_.size());
-                }
-            }
-
-            if (best_j >= 0 && best_d2 < CHI2_GATE_2DOF) {
-                bool applied = ekf_->updateCornerLandmark(best_j, cx_obs, cy_obs, Q_corner_);
-                if (!applied) {
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
-                        1000,
-                        "Corner update skipped: S near-singular for landmark idx=%d",
-                        best_j);
-                }
-            } else if (n_corners < static_cast<int>(MAX_CORNER_LANDMARKS)) {
-                tryConfirmCornerAndAugment(obs.xw, obs.yw);
-            }
-        }
-
-        for (auto it = corner_candidates_.begin(); it != corner_candidates_.end();) {
-            if (scans_seen_ - it->last_seen_scan > CANDIDATE_TTL) {
-                it = corner_candidates_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    void tryConfirmCornerAndAugment(double xw, double yw) {
-        // Match candidates in WORLD frame (corner viz + extractor return both).
-        // Augment uses the robot-frame value derived back from the world point
-        // and current pose; here we just track world-frame for stability.
-        int best = -1;
-        double best_dist = std::numeric_limits<double>::infinity();
-        for (size_t i = 0; i < corner_candidates_.size(); ++i) {
-            double dxw = std::abs(xw - corner_candidates_[i].xw);
-            double dyw = std::abs(yw - corner_candidates_[i].yw);
-            if (dxw < CONFIRM_XY_TOL_M && dyw < CONFIRM_XY_TOL_M) {
-                double d = dxw + dyw;
-                if (d < best_dist) {
-                    best_dist = d;
-                    best      = static_cast<int>(i);
-                }
-            }
-        }
-        if (best < 0) {
-            corner_candidates_.push_back({xw, yw, 1, static_cast<int>(scans_seen_)});
-            return;
-        }
-        auto& c = corner_candidates_[best];
-        if (c.last_seen_scan == static_cast<int>(scans_seen_)) return;
-        c.hits          += 1;
-        c.last_seen_scan = static_cast<int>(scans_seen_);
-        c.xw             = 0.5 * (c.xw + xw);
-        c.yw             = 0.5 * (c.yw + yw);
-        if (c.hits >= N_CONFIRM) {
-            // Convert the confirmed world-frame candidate back to robot frame
-            // for the augment, since augmentCornerFromObservation expects
-            // robot-frame inputs.
-            Eigen::Vector4d pose = ekf_->getPose();
-            double psi = pose(3);
-            double cs  = std::cos(-psi);
-            double sn  = std::sin(-psi);
-            double dx  = c.xw - pose(0);
-            double dy  = c.yw - pose(1);
-            double cx_r = cs * dx - sn * dy;
-            double cy_r = sn * dx + cs * dy;
-            ekf_->augmentCornerFromObservation(cx_r, cy_r, Q_corner_);
-            RCLCPP_INFO(this->get_logger(),
-                "[augment] new corner landmark: world=(%.3f, %.3f) (after %d hits) | "
-                "n_corners=%d state_dim=%d",
-                c.xw, c.yw, c.hits,
-                ekf_->nCorners(), ekf_->stateDim());
-            corner_candidates_.erase(corner_candidates_.begin() + best);
-        }
-    }
+    // Corner SLAM removed: corners are derived geometrically from the line
+    // landmarks at visualization time (publishStateLandmarkCorners). No
+    // corner state, no corner Kalman update, no corner candidate buffer.
 
 
     void publishLineMarkers(const std::vector<ekf_slam::LineObs>& lines) {
@@ -765,11 +736,10 @@ private:
         del.action          = visualization_msgs::msg::Marker::DELETEALL;
         arr.markers.push_back(del);
 
-        const Eigen::VectorXd& mu = ekf_->getState();
-        int n_lm = ekf_->nLandmarks2();
+        const Eigen::VectorXd& mu = landmark_filter_->getState();
+        int n_lm = landmark_filter_->nLandmarks();
         for (int k = 0; k < n_lm; ++k) {
-            if (ekf_->landmarkKind(k) != ekf_slam::LandmarkKind::Line) continue;
-            int idx = 4 + 2 * k;
+            int idx = 2 * k;
             double rho_w   = mu(idx);
             double theta_w = mu(idx + 1);
 
@@ -800,7 +770,12 @@ private:
         landmark_lines_pub_->publish(arr);
     }
 
-    /// Render every persisted corner landmark in the EKF state.
+    /// Render corners DERIVED geometrically from the line landmarks already
+    /// in the EKF state. Corners are NOT part of the state — they're a pure
+    /// post-processing visualization. For each pair of stored lines whose
+    /// normals are near-perpendicular (|cos(θ1-θ2)| < 0.3), solve the 2x2
+    /// system [cosθ1 sinθ1; cosθ2 sinθ2] [cx; cy] = [ρ1; ρ2] for the
+    /// intersection point.
     void publishStateLandmarkCorners() {
         visualization_msgs::msg::MarkerArray arr;
         visualization_msgs::msg::Marker del;
@@ -809,40 +784,75 @@ private:
         del.action          = visualization_msgs::msg::Marker::DELETEALL;
         arr.markers.push_back(del);
 
-        const Eigen::VectorXd& mu = ekf_->getState();
-        int n_lm = ekf_->nLandmarks2();
-        for (int k = 0; k < n_lm; ++k) {
-            if (ekf_->landmarkKind(k) != ekf_slam::LandmarkKind::Corner) continue;
-            int idx = 4 + 2 * k;
+        const Eigen::VectorXd& mu = landmark_filter_->getState();
+        int n_lm = landmark_filter_->nLandmarks();
 
-            visualization_msgs::msg::Marker m;
-            m.header.frame_id    = "map";
-            m.header.stamp       = this->now();
-            m.ns                 = "ekf_slam_landmark_corners";
-            m.id                 = k;
-            m.type               = visualization_msgs::msg::Marker::CUBE;
-            m.action             = visualization_msgs::msg::Marker::ADD;
-            m.pose.position.x    = mu(idx);
-            m.pose.position.y    = mu(idx + 1);
-            m.pose.position.z    = 0.0;
-            m.pose.orientation.w = 1.0;
-            m.scale.x            = 0.12;
-            m.scale.y            = 0.12;
-            m.scale.z            = 0.12;
-            m.color.r            = 0.95f;
-            m.color.g            = 0.85f;
-            m.color.b            = 0.1f;
-            m.color.a            = 1.0f;
-            arr.markers.push_back(m);
+        struct LineLm { double rho; double theta; };
+        std::vector<LineLm> lines;
+        lines.reserve(n_lm);
+        for (int k = 0; k < n_lm; ++k) {
+            int idx = 2 * k;
+            lines.push_back({mu(idx), mu(idx + 1)});
+        }
+
+        // Bound: anything outside this is past the room walls — skip it.
+        constexpr double ROOM_HALF_M   = 2.0;
+        constexpr double ROOM_MARGIN_M = 0.5;
+        constexpr double LIMIT = ROOM_HALF_M + ROOM_MARGIN_M;
+
+        int marker_id = 0;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            for (size_t j = i + 1; j < lines.size(); ++j) {
+                double t1 = lines[i].theta;
+                double t2 = lines[j].theta;
+                // Perpendicularity gate: |cos(t1 - t2)| < 0.3 → angle within
+                // ~17° of 90°.
+                if (std::abs(std::cos(t1 - t2)) >= 0.3) continue;
+
+                // Solve the 2x2 system.
+                Eigen::Matrix2d A;
+                A << std::cos(t1), std::sin(t1),
+                     std::cos(t2), std::sin(t2);
+                Eigen::Vector2d b(lines[i].rho, lines[j].rho);
+                double det = A.determinant();
+                if (std::abs(det) < 1e-6) continue;
+                Eigen::Vector2d c = A.inverse() * b;
+                double cx = c(0);
+                double cy = c(1);
+                if (std::abs(cx) > LIMIT || std::abs(cy) > LIMIT) continue;
+
+                visualization_msgs::msg::Marker m;
+                m.header.frame_id    = "map";
+                m.header.stamp       = this->now();
+                m.ns                 = "ekf_slam_derived_corners";
+                m.id                 = marker_id++;
+                m.type               = visualization_msgs::msg::Marker::CUBE;
+                m.action             = visualization_msgs::msg::Marker::ADD;
+                m.pose.position.x    = cx;
+                m.pose.position.y    = cy;
+                m.pose.position.z    = 0.0;
+                m.pose.orientation.w = 1.0;
+                m.scale.x            = 0.12;
+                m.scale.y            = 0.12;
+                m.scale.z            = 0.12;
+                m.color.r            = 0.95f;
+                m.color.g            = 0.85f;
+                m.color.b            = 0.1f;
+                m.color.a            = 1.0f;
+                arr.markers.push_back(m);
+            }
         }
         landmark_corners_pub_->publish(arr);
     }
 
     void logSlamState(const std::vector<ekf_slam::LineObs>& lines,
                       bool ran_scan_to_map) {
-        int n_lines   = ekf_->nLines();
-        int n_corners = ekf_->nCorners();
-        int dim       = ekf_->stateDim();
+        // Two-filter architecture: pose EKF is fixed 4-state; landmark filter
+        // owns the (rho, theta) line landmarks. Corners are derived
+        // geometrically and have no state.
+        int n_lines   = landmark_filter_->nLandmarks();
+        int n_corners = 0;
+        int dim       = 4 + landmark_filter_->stateDim();
         const char* sm = ran_scan_to_map ? "scan2map=on" : "scan2map=skipped";
         if (lines.empty()) {
             RCLCPP_INFO(this->get_logger(),
@@ -905,7 +915,8 @@ private:
         pose_cov_pub_->publish(pose_cov_msg);
     }
 
-    std::unique_ptr<ekf_slam::EKFCore> ekf_;
+    std::unique_ptr<ekf_slam::EKFCore>        ekf_;
+    std::unique_ptr<ekf_slam::LandmarkFilter> landmark_filter_;
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        odom_sub_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr    scan_sub_;
@@ -940,6 +951,18 @@ private:
     // Latch: line landmark augment/update is gated until the first time
     // scan-to-map successfully runs and corrects the pose.
     bool scan_to_map_initialized_ = false;
+
+    // Guard A: dropout-watchdog state. Once scan-to-map has been working,
+    // count consecutive valid-gate scans where it returned invalid. After
+    // SM_DROPOUT_THRESHOLD failures pause landmark augment/update; resume
+    // when scan-to-map produces a valid match again.
+    static constexpr int SM_DROPOUT_THRESHOLD = 30;  // ~3 s at 10 Hz
+    int  sm_failed_streak_ = 0;
+    bool landmarks_paused_ = false;
+
+    // Cached commanded vz from /cmd_vel — used by the descent gate in
+    // scanCallback to freeze xy corrections during straight-down landings.
+    double last_cmd_vz_ = 0.0;
 
     // Scan counter (for confirmation-buffer TTL and start-of-flight diag).
     unsigned long scans_seen_ = 0;

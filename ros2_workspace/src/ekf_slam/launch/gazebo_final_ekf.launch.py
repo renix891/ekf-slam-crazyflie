@@ -1,10 +1,16 @@
-"""Full autonomous-navigation stack in Gazebo using EKF-corrected pose.
+"""Final validation experiment — EKF-SLAM run.
 
-Pipeline tested:
-    Gazebo -> bridge -> mapper + ekf_slam -> planning -> navigation -> box_landing
-A goal_pose at the landing pad is published 5 s after launch so D* Lite plans
-straight away. A bag captures odom, ekf_pose, map, planned_path, cmd_vel for
-post-flight comparison against the odom-only baseline.
+Byte-for-byte copy of gazebo_full_nav.launch.py (the proven flight) with
+two additions:
+  * BAG_DIR points at results/final_ekf_bag/
+  * mission_orchestrator is started at t=12s alongside publish_goal/enable_nav.
+    The orchestrator does NOT touch the outbound leg — it watches for the
+    outbound landing, hovers HOVER_S seconds, then publishes the (0,0)
+    return goal and re-enables /enable_autonomous. box_landing stays disabled
+    throughout.
+
+Companion: gazebo_final_odom.launch.py (same flight, but pose comes from
+odom_to_pose.py with cumulative Brownian noise instead of EKF-SLAM).
 """
 
 import os
@@ -31,7 +37,10 @@ WORLD_FILE = os.path.join(SIM_GAZEBO_DIR, 'worlds', 'crazyflie_world.sdf')
 HOVER_SCRIPT = os.path.join(
     PROJECT_DIR, 'ros2_workspace', 'src', 'ekf_slam', 'scripts',
     'gz_hover.py')
-BAG_DIR = os.path.join(PROJECT_DIR, 'results', 'gazebo_full_nav_ekf_bag')
+ORCHESTRATOR_SCRIPT = os.path.join(
+    PROJECT_DIR, 'ros2_workspace', 'src', 'ekf_slam', 'scripts',
+    'mission_orchestrator.py')
+BAG_DIR = os.path.join(PROJECT_DIR, 'results', 'final_ekf_bag')
 BAG_TOPICS = [
     '/crazyflie/odom',
     '/crazyflie/scan',
@@ -108,13 +117,6 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
         output='screen')
 
-    box_landing = Node(
-        package='crazyflie_navigation',
-        executable='box_landing_node',
-        name='box_landing_node',
-        parameters=[{'use_sim_time': use_sim_time}],
-        output='screen')
-
     # Climb to hover altitude and exit — releases /cmd_vel so navigation_node
     # can drive without contention.
     hover = ExecuteProcess(
@@ -142,6 +144,14 @@ def generate_launch_description():
         ],
         output='screen')
 
+    # Mission orchestrator: idle through outbound (the launch file handles it),
+    # then watch for outbound landing → hover → publish return goal at (0,0)
+    # → watch for return landing → log final pose. Does NOT touch the
+    # outbound leg.
+    orchestrator = ExecuteProcess(
+        cmd=['python3', ORCHESTRATOR_SCRIPT],
+        output='screen')
+
     bag_record = ExecuteProcess(
         cmd=['ros2', 'bag', 'record', '-o', BAG_DIR] + BAG_TOPICS,
         output='screen')
@@ -158,8 +168,10 @@ def generate_launch_description():
         gz_sim,
         TimerAction(period=3.0, actions=[bridge, hover]),
         TimerAction(period=5.0, actions=[mapper, ekf_slam, bag_record]),
-        TimerAction(period=6.0, actions=[planning, navigation, box_landing]),
+        TimerAction(period=6.0, actions=[planning, navigation]),
         # Goal + nav-enable fire at t=12 so hover (~5 s) has fully released
         # /cmd_vel and EKF/mapper have ~7 s to seed pose and the map.
-        TimerAction(period=12.0, actions=[publish_goal, enable_nav]),
+        # Orchestrator joins at t=12 too — it boots in OUTBOUND state and
+        # does nothing until the drone lands at (0.8, 0).
+        TimerAction(period=12.0, actions=[publish_goal, enable_nav, orchestrator]),
     ])

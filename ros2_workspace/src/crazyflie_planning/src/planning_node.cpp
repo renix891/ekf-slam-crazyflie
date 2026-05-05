@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 #include <cmath>
+#include <unordered_map>
 
 class DStarLitePathPlanningNode : public rclcpp::Node {
 public:
@@ -86,6 +87,19 @@ private:
                 "Received first pose: (%.2f, %.2f, %.2f)",
                 msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
         }
+
+        // Visit-decay tracking: record current grid cell with timestamp so
+        // the cost map can penalize recently-visited cells and discourage
+        // oscillation.
+        if (occupancy_grid_msg_) {
+            auto g = worldToGrid(msg->pose.position.x, msg->pose.position.y);
+            if (g) {
+                int64_t key = static_cast<int64_t>(g->second) *
+                              static_cast<int64_t>(occupancy_grid_msg_->info.width) +
+                              static_cast<int64_t>(g->first);
+                visited_cells_[key] = this->now().seconds();
+            }
+        }
     }
 
     void goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -126,14 +140,50 @@ private:
             if (!goal_grid) return;
         }
 
-        // Compute path
+        auto base_cost = occupancyToCostMap(*occupancy_grid_msg_);
+        planner_->setCostMap(base_cost);
         auto path = planner_->computePath(
             start_grid->first, start_grid->second,
             goal_grid->first, goal_grid->second);
 
-        // Publish path
         if (!path.empty()) {
             publishPath(path);
+        }
+    }
+
+    // Add per-cell penalties to recently-visited cells. Penalties are
+    // intentionally MILD so the planner is biased toward forward progress
+    // but can still backtrack when needed (e.g. after a dead-end). The
+    // earlier values (50/20) overwhelmed the obstacle ramp (3-8.6) and
+    // made the drone refuse to reapproach a goal it had passed near once.
+    //   age <= 5s   → cost += 4   (one obstacle-ramp step)
+    //   age <= 15s  → cost += 2
+    //   age >  15s  → no penalty
+    // Cells older than 30s are pruned to bound memory.
+    void applyVisitDecay(std::vector<std::vector<double>>& cost_map) {
+        if (!occupancy_grid_msg_ || visited_cells_.empty()) return;
+        const int width  = static_cast<int>(occupancy_grid_msg_->info.width);
+        const int height = static_cast<int>(occupancy_grid_msg_->info.height);
+        const double now_s = this->now().seconds();
+
+        for (auto it = visited_cells_.begin(); it != visited_cells_.end(); ) {
+            double age = now_s - it->second;
+            if (age > 30.0) {
+                it = visited_cells_.erase(it);
+                continue;
+            }
+            int64_t key = it->first;
+            int gx = static_cast<int>(key % width);
+            int gy = static_cast<int>(key / width);
+            if (gx >= 0 && gx < width && gy >= 0 && gy < height) {
+                double penalty = 0.0;
+                if (age <= 5.0)        penalty = 4.0;
+                else if (age <= 15.0)  penalty = 2.0;
+                if (penalty > 0.0 && std::isfinite(cost_map[gx][gy])) {
+                    cost_map[gx][gy] += penalty;
+                }
+            }
+            ++it;
         }
     }
 
@@ -202,10 +252,14 @@ private:
                     // Free: low cost
                     cost_map[x][y] = 1.0;
                 } else if (val <= 50) {
-                    // Weighted avoidance zone near obstacles: gentle ramp
-                    // (3.0-10.0) — keeps some clearance preference while
-                    // leaving the planner room to route around obstacles.
-                    cost_map[x][y] = 3.0 + (val / 50.0) * 7.0;
+                    // Weighted avoidance zone near obstacles. Ramp lowered
+                    // again to 3.0–5.8 — drone was over-conservative around
+                    // obstacle inflation halos and refusing perfectly clear
+                    // gaps. With avoidance_distance also down to 0.10m the
+                    // halos are smaller, and within them the cost penalty
+                    // is now mild enough that the planner picks tight gaps
+                    // when they're shorter.
+                    cost_map[x][y] = 3.0 + (val / 50.0) * 2.8;
                 } else {
                     // Obstacle: infinite cost
                     cost_map[x][y] = std::numeric_limits<double>::infinity();
@@ -350,6 +404,10 @@ private:
 
     double planning_freq_;
     double flight_height_;
+
+    // Visit-decay state: map from linear grid index → wall-clock seconds of
+    // last visit. Updated in poseCallback, consumed by applyVisitDecay().
+    std::unordered_map<int64_t, double> visited_cells_;
 };
 
 int main(int argc, char** argv) {

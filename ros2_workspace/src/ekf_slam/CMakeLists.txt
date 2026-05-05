@@ -29,6 +29,7 @@ include_directories(
 add_library(ekf_core
   src/ekf_core.cpp
   src/line_extractor.cpp
+  src/landmark_filter.cpp
 )
 
 target_include_directories(ekf_core PUBLIC

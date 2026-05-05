@@ -15,3 +15,6 @@ CMakeCache.txt
 results/**/*.mcap
 results/**/*.db3
 results/gazebo_*_bag/
+results/final_*_bag/
+results/diagnostic/
+

@@ -12,9 +12,14 @@ MapperNode::MapperNode()
 : rclcpp::Node("crazyflie_mapper_node")
 {
   // Parameters (defaults mirror the Python simple_mapper_node.py)
-  avoidance_distance_    = this->declare_parameter<double>("avoidance_distance", 0.6);
+  avoidance_distance_    = this->declare_parameter<double>("avoidance_distance", 0.10);
   max_avoidance_weight_  = this->declare_parameter<int>("max_avoidance_weight", 50);
-  max_obstacle_range_    = this->declare_parameter<double>("max_obstacle_range", 1.0);
+  // Raised from 1.0 m to 3.0 m: the multiranger reaches ~3.5 m and our room
+  // is ~4 m on a side, so the 1 m cap was rejecting most beam returns when
+  // the drone was anywhere in the middle of the room. The map ended up
+  // sparse (~30 cells) and only filled in when the drone happened to come
+  // within 1 m of a wall. With 3.0 m the map fills in walls properly.
+  max_obstacle_range_    = this->declare_parameter<double>("max_obstacle_range", 3.0);
 
   map_size_x_    = this->declare_parameter<double>("map_size_x", 40.0);
   map_size_y_    = this->declare_parameter<double>("map_size_y", 20.0);

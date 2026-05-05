@@ -1,10 +1,14 @@
-"""Full autonomous-navigation stack in Gazebo using EKF-corrected pose.
+"""Final validation experiment — odometry-only baseline run.
 
-Pipeline tested:
-    Gazebo -> bridge -> mapper + ekf_slam -> planning -> navigation -> box_landing
-A goal_pose at the landing pad is published 5 s after launch so D* Lite plans
-straight away. A bag captures odom, ekf_pose, map, planned_path, cmd_vel for
-post-flight comparison against the odom-only baseline.
+Byte-for-byte copy of gazebo_full_nav.launch.py with three changes:
+  * ekf_slam_node replaced by odom_to_pose.py (publishes /ekf_pose from
+    /crazyflie/odom + cumulative Brownian noise on x, y, yaw — simulates
+    an IMU-only pose estimate without external correction).
+  * BAG_DIR points at results/final_odom_bag/.
+  * mission_orchestrator added at t=12s for the return leg.
+
+Compare landing accuracy on the return leg vs the EKF run to demonstrate
+the value of EKF-SLAM correction.
 """
 
 import os
@@ -31,7 +35,13 @@ WORLD_FILE = os.path.join(SIM_GAZEBO_DIR, 'worlds', 'crazyflie_world.sdf')
 HOVER_SCRIPT = os.path.join(
     PROJECT_DIR, 'ros2_workspace', 'src', 'ekf_slam', 'scripts',
     'gz_hover.py')
-BAG_DIR = os.path.join(PROJECT_DIR, 'results', 'gazebo_full_nav_ekf_bag')
+ODOM_TO_POSE_SCRIPT = os.path.join(
+    PROJECT_DIR, 'ros2_workspace', 'src', 'ekf_slam', 'scripts',
+    'odom_to_pose.py')
+ORCHESTRATOR_SCRIPT = os.path.join(
+    PROJECT_DIR, 'ros2_workspace', 'src', 'ekf_slam', 'scripts',
+    'mission_orchestrator.py')
+BAG_DIR = os.path.join(PROJECT_DIR, 'results', 'final_odom_bag')
 BAG_TOPICS = [
     '/crazyflie/odom',
     '/crazyflie/scan',
@@ -40,8 +50,6 @@ BAG_TOPICS = [
     '/planned_path',
     '/goal_pose',
     '/cmd_vel',
-    '/ekf_slam/debug/landmark_lines',
-    '/ekf_slam/debug/landmark_corners',
 ]
 
 # Landing-pad goal (matches the box position assumed by the box_landing test).
@@ -87,11 +95,13 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
         output='screen')
 
-    ekf_slam = Node(
-        package='ekf_slam',
-        executable='ekf_slam_node',
-        name='ekf_slam_node',
-        parameters=[{'use_sim_time': use_sim_time}],
+    # Pose source: odom + Brownian noise. No EKF-SLAM node in this run.
+    odom_to_pose = ExecuteProcess(
+        cmd=['python3', ODOM_TO_POSE_SCRIPT,
+             '--ros-args',
+             '-p', 'enable_noise:=true',
+             '-p', 'sigma_xy_per_s:=0.003',
+             '-p', 'sigma_yaw_per_s:=0.001'],
         output='screen')
 
     planning = Node(
@@ -108,20 +118,10 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
         output='screen')
 
-    box_landing = Node(
-        package='crazyflie_navigation',
-        executable='box_landing_node',
-        name='box_landing_node',
-        parameters=[{'use_sim_time': use_sim_time}],
-        output='screen')
-
-    # Climb to hover altitude and exit — releases /cmd_vel so navigation_node
-    # can drive without contention.
     hover = ExecuteProcess(
         cmd=['python3', HOVER_SCRIPT],
         output='screen')
 
-    # Enable the autonomous navigation service so the planner's path is followed.
     enable_nav = ExecuteProcess(
         cmd=[
             'ros2', 'service', 'call', '/enable_autonomous',
@@ -129,7 +129,6 @@ def generate_launch_description():
         ],
         output='screen')
 
-    # Publish a single goal_pose so D* Lite plans toward the landing pad.
     publish_goal = ExecuteProcess(
         cmd=[
             'ros2', 'topic', 'pub', '--once', '/goal_pose',
@@ -142,11 +141,14 @@ def generate_launch_description():
         ],
         output='screen')
 
+    orchestrator = ExecuteProcess(
+        cmd=['python3', ORCHESTRATOR_SCRIPT],
+        output='screen')
+
     bag_record = ExecuteProcess(
         cmd=['ros2', 'bag', 'record', '-o', BAG_DIR] + BAG_TOPICS,
         output='screen')
 
-    # ros2 bag refuses to overwrite; clean any previous run.
     clean_bag_dir = ExecuteProcess(
         cmd=['rm', '-rf', BAG_DIR],
         output='screen')
@@ -157,9 +159,7 @@ def generate_launch_description():
         clean_bag_dir,
         gz_sim,
         TimerAction(period=3.0, actions=[bridge, hover]),
-        TimerAction(period=5.0, actions=[mapper, ekf_slam, bag_record]),
-        TimerAction(period=6.0, actions=[planning, navigation, box_landing]),
-        # Goal + nav-enable fire at t=12 so hover (~5 s) has fully released
-        # /cmd_vel and EKF/mapper have ~7 s to seed pose and the map.
-        TimerAction(period=12.0, actions=[publish_goal, enable_nav]),
+        TimerAction(period=5.0, actions=[mapper, odom_to_pose, bag_record]),
+        TimerAction(period=6.0, actions=[planning, navigation]),
+        TimerAction(period=12.0, actions=[publish_goal, enable_nav, orchestrator]),
     ])
