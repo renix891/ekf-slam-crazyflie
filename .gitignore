@@ -14,6 +14,7 @@ CMakeCache.txt
 *.png
 results/**/*.mcap
 results/**/*.db3
+**/metadata.yaml
 results/gazebo_*_bag*/
 results/final_*_bag*/
 results/diagnostic/
