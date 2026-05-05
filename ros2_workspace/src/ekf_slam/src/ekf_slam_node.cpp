@@ -38,6 +38,14 @@ public:
         Q_line_(0, 0) = 0.04;   // 2 * 0.02
         Q_line_(1, 1) = 0.02;   // 2 * 0.01
 
+        // Q_corner: 2x the extractor's per-axis variance (0.04) for the same
+        // reason — front-end noise is correlated across the simultaneous line
+        // and corner observations from a single scan, so corner updates get
+        // an inflated noise to avoid double-counting.
+        Q_corner_ = Eigen::Matrix2d::Zero();
+        Q_corner_(0, 0) = 0.08;
+        Q_corner_(1, 1) = 0.08;
+
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/crazyflie/odom", 10,
             std::bind(&EKFSlamNode::odomCallback, this, std::placeholders::_1));
@@ -72,14 +80,18 @@ public:
             "/ekf_slam/debug/corners", 10);
         landmark_lines_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
             "/ekf_slam/debug/landmark_lines", 10);
+        landmark_corners_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/ekf_slam/debug/landmark_corners", 10);
 
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(100),
             std::bind(&EKFSlamNode::publishPose, this));
 
         RCLCPP_INFO(this->get_logger(),
-            "EKF-SLAM hybrid initialized: scan-to-map primary + line landmarks (max %d)",
-            static_cast<int>(MAX_LINE_LANDMARKS));
+            "EKF-SLAM hybrid initialized: scan-to-map primary + line landmarks "
+            "(max %d) + corner landmarks (max %d)",
+            static_cast<int>(MAX_LINE_LANDMARKS),
+            static_cast<int>(MAX_CORNER_LANDMARKS));
     }
 
 private:
@@ -325,8 +337,10 @@ private:
         publishCornerMarkers(corners);
 
         runLineSlamUpdate(lines);
+        runCornerSlamUpdate(corners);
 
         publishStateLandmarkLines();
+        publishStateLandmarkCorners();
         logSlamState(lines, ran_scan_to_map);
     }
 
@@ -387,13 +401,16 @@ private:
                 continue;
             }
 
-            const int n_lm   = ekf_->nLandmarks2();
+            const int n_lm    = ekf_->nLandmarks2();
+            const int n_lines = ekf_->nLines();
             int   best_j     = -1;
             double best_d2   = std::numeric_limits<double>::infinity();
             Eigen::Vector2d best_z_pred(0, 0);
             Eigen::Vector2d best_nu(0, 0);
 
+            // DA: predict only against line landmarks. Skip corner blocks.
             for (int k = 0; k < n_lm; ++k) {
+                if (ekf_->landmarkKind(k) != ekf_slam::LandmarkKind::Line) continue;
                 int idx = 4 + 2 * k;
                 Eigen::Vector2d z_pred;
                 Eigen::MatrixXd H;
@@ -448,12 +465,12 @@ private:
                         N, N);
                     logged_first_update_ = true;
                 }
-            } else if (n_lm < static_cast<int>(MAX_LINE_LANDMARKS)) {
+            } else if (n_lines < static_cast<int>(MAX_LINE_LANDMARKS)) {
                 // Route through the confirmation buffer instead of augmenting
                 // straight into the state.
-                tryConfirmAndAugment(rho_obs, theta_obs);
+                tryConfirmLineAndAugment(rho_obs, theta_obs);
             }
-            // else: cap reached, no association — drop this observation.
+            // else: line cap reached, no association — drop this observation.
         }
 
         // Age out stale candidates.
@@ -466,7 +483,7 @@ private:
         }
     }
 
-    void tryConfirmAndAugment(double rho_obs, double theta_obs) {
+    void tryConfirmLineAndAugment(double rho_obs, double theta_obs) {
         // Find the nearest candidate within the confirm tolerance.
         int best = -1;
         double best_dist = std::numeric_limits<double>::infinity();
@@ -507,6 +524,149 @@ private:
             line_candidates_.erase(line_candidates_.begin() + best);
         }
     }
+
+    // -------------------- Corner landmark SLAM --------------------
+    static constexpr size_t MAX_CORNER_LANDMARKS = 20;
+    static constexpr double CONFIRM_XY_TOL_M     = 0.10;
+
+    struct CornerCandidate {
+        double xw;
+        double yw;
+        int    hits;
+        int    last_seen_scan;
+    };
+    std::vector<CornerCandidate> corner_candidates_;
+
+    void runCornerSlamUpdate(const std::vector<ekf_slam::CornerObs>& corners) {
+        if (!scan_to_map_initialized_) return;
+
+        bool diag_this_scan = false;
+        double now_s = this->now().seconds();
+        if (now_s - last_corner_diag_s_ >= 1.0) {
+            last_corner_diag_s_ = now_s;
+            diag_this_scan      = true;
+        }
+
+        for (size_t obs_i = 0; obs_i < corners.size(); ++obs_i) {
+            const auto& obs = corners[obs_i];
+            const double cx_obs = obs.x;
+            const double cy_obs = obs.y;
+
+            const int n_lm      = ekf_->nLandmarks2();
+            const int n_corners = ekf_->nCorners();
+            int   best_j   = -1;
+            double best_d2 = std::numeric_limits<double>::infinity();
+            Eigen::Vector2d best_z_pred(0, 0);
+            Eigen::Vector2d best_nu(0, 0);
+
+            for (int k = 0; k < n_lm; ++k) {
+                if (ekf_->landmarkKind(k) != ekf_slam::LandmarkKind::Corner) continue;
+                int idx = 4 + 2 * k;
+                Eigen::Vector2d z_pred;
+                Eigen::MatrixXd H;
+                ekf_->predictCornerObservation(idx, z_pred, H);
+                Eigen::Vector2d nu;
+                nu(0) = cx_obs - z_pred(0);
+                nu(1) = cy_obs - z_pred(1);
+                Eigen::Matrix2d S = H * ekf_->getCovariance() * H.transpose() + Q_corner_;
+                double d2 = nu.transpose() * S.inverse() * nu;
+                if (d2 < best_d2) {
+                    best_d2     = d2;
+                    best_j      = idx;
+                    best_z_pred = z_pred;
+                    best_nu     = nu;
+                }
+            }
+
+            if (diag_this_scan && obs_i == 0) {
+                if (best_j >= 0) {
+                    RCLCPP_INFO(this->get_logger(),
+                        "[DA-c] obs=(cx=%.3f cy=%.3f) | nearest_lm idx=%d "
+                        "z_pred=(%.3f, %.3f) innov=(%.3f, %.3f) d2=%.2f "
+                        "(gate=%.2f) | n_corners=%d candidates=%zu",
+                        cx_obs, cy_obs, best_j,
+                        best_z_pred(0), best_z_pred(1),
+                        best_nu(0), best_nu(1), best_d2,
+                        CHI2_GATE_2DOF, n_corners, corner_candidates_.size());
+                } else {
+                    RCLCPP_INFO(this->get_logger(),
+                        "[DA-c] obs=(cx=%.3f cy=%.3f) | no existing corners | "
+                        "candidates=%zu",
+                        cx_obs, cy_obs, corner_candidates_.size());
+                }
+            }
+
+            if (best_j >= 0 && best_d2 < CHI2_GATE_2DOF) {
+                bool applied = ekf_->updateCornerLandmark(best_j, cx_obs, cy_obs, Q_corner_);
+                if (!applied) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                        1000,
+                        "Corner update skipped: S near-singular for landmark idx=%d",
+                        best_j);
+                }
+            } else if (n_corners < static_cast<int>(MAX_CORNER_LANDMARKS)) {
+                tryConfirmCornerAndAugment(obs.xw, obs.yw);
+            }
+        }
+
+        for (auto it = corner_candidates_.begin(); it != corner_candidates_.end();) {
+            if (scans_seen_ - it->last_seen_scan > CANDIDATE_TTL) {
+                it = corner_candidates_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void tryConfirmCornerAndAugment(double xw, double yw) {
+        // Match candidates in WORLD frame (corner viz + extractor return both).
+        // Augment uses the robot-frame value derived back from the world point
+        // and current pose; here we just track world-frame for stability.
+        int best = -1;
+        double best_dist = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < corner_candidates_.size(); ++i) {
+            double dxw = std::abs(xw - corner_candidates_[i].xw);
+            double dyw = std::abs(yw - corner_candidates_[i].yw);
+            if (dxw < CONFIRM_XY_TOL_M && dyw < CONFIRM_XY_TOL_M) {
+                double d = dxw + dyw;
+                if (d < best_dist) {
+                    best_dist = d;
+                    best      = static_cast<int>(i);
+                }
+            }
+        }
+        if (best < 0) {
+            corner_candidates_.push_back({xw, yw, 1, static_cast<int>(scans_seen_)});
+            return;
+        }
+        auto& c = corner_candidates_[best];
+        if (c.last_seen_scan == static_cast<int>(scans_seen_)) return;
+        c.hits          += 1;
+        c.last_seen_scan = static_cast<int>(scans_seen_);
+        c.xw             = 0.5 * (c.xw + xw);
+        c.yw             = 0.5 * (c.yw + yw);
+        if (c.hits >= N_CONFIRM) {
+            // Convert the confirmed world-frame candidate back to robot frame
+            // for the augment, since augmentCornerFromObservation expects
+            // robot-frame inputs.
+            Eigen::Vector4d pose = ekf_->getPose();
+            double psi = pose(3);
+            double cs  = std::cos(-psi);
+            double sn  = std::sin(-psi);
+            double dx  = c.xw - pose(0);
+            double dy  = c.yw - pose(1);
+            double cx_r = cs * dx - sn * dy;
+            double cy_r = sn * dx + cs * dy;
+            ekf_->augmentCornerFromObservation(cx_r, cy_r, Q_corner_);
+            RCLCPP_INFO(this->get_logger(),
+                "[augment] new corner landmark: world=(%.3f, %.3f) (after %d hits) | "
+                "n_corners=%d state_dim=%d",
+                c.xw, c.yw, c.hits,
+                ekf_->nCorners(), ekf_->stateDim());
+            corner_candidates_.erase(corner_candidates_.begin() + best);
+        }
+    }
+
 
     void publishLineMarkers(const std::vector<ekf_slam::LineObs>& lines) {
         visualization_msgs::msg::MarkerArray arr;
@@ -595,6 +755,7 @@ private:
         const Eigen::VectorXd& mu = ekf_->getState();
         int n_lm = ekf_->nLandmarks2();
         for (int k = 0; k < n_lm; ++k) {
+            if (ekf_->landmarkKind(k) != ekf_slam::LandmarkKind::Line) continue;
             int idx = 4 + 2 * k;
             double rho_w   = mu(idx);
             double theta_w = mu(idx + 1);
@@ -626,20 +787,61 @@ private:
         landmark_lines_pub_->publish(arr);
     }
 
+    /// Render every persisted corner landmark in the EKF state.
+    void publishStateLandmarkCorners() {
+        visualization_msgs::msg::MarkerArray arr;
+        visualization_msgs::msg::Marker del;
+        del.header.frame_id = "map";
+        del.header.stamp    = this->now();
+        del.action          = visualization_msgs::msg::Marker::DELETEALL;
+        arr.markers.push_back(del);
+
+        const Eigen::VectorXd& mu = ekf_->getState();
+        int n_lm = ekf_->nLandmarks2();
+        for (int k = 0; k < n_lm; ++k) {
+            if (ekf_->landmarkKind(k) != ekf_slam::LandmarkKind::Corner) continue;
+            int idx = 4 + 2 * k;
+
+            visualization_msgs::msg::Marker m;
+            m.header.frame_id    = "map";
+            m.header.stamp       = this->now();
+            m.ns                 = "ekf_slam_landmark_corners";
+            m.id                 = k;
+            m.type               = visualization_msgs::msg::Marker::CUBE;
+            m.action             = visualization_msgs::msg::Marker::ADD;
+            m.pose.position.x    = mu(idx);
+            m.pose.position.y    = mu(idx + 1);
+            m.pose.position.z    = 0.0;
+            m.pose.orientation.w = 1.0;
+            m.scale.x            = 0.12;
+            m.scale.y            = 0.12;
+            m.scale.z            = 0.12;
+            m.color.r            = 0.95f;
+            m.color.g            = 0.85f;
+            m.color.b            = 0.1f;
+            m.color.a            = 1.0f;
+            arr.markers.push_back(m);
+        }
+        landmark_corners_pub_->publish(arr);
+    }
+
     void logSlamState(const std::vector<ekf_slam::LineObs>& lines,
                       bool ran_scan_to_map) {
-        int n_lm = ekf_->nLandmarks2();
-        int dim  = ekf_->stateDim();
+        int n_lines   = ekf_->nLines();
+        int n_corners = ekf_->nCorners();
+        int dim       = ekf_->stateDim();
         const char* sm = ran_scan_to_map ? "scan2map=on" : "scan2map=skipped";
         if (lines.empty()) {
             RCLCPP_INFO(this->get_logger(),
-                "Line landmarks: %d | State dim: %d | %s | (no obs this scan)",
-                n_lm, dim, sm);
+                "Line landmarks: %d | Corner landmarks: %d | State dim: %d | %s | "
+                "(no line obs)",
+                n_lines, n_corners, dim, sm);
         } else {
             const auto& last = lines.back();
             RCLCPP_INFO(this->get_logger(),
-                "Line landmarks: %d | State dim: %d | %s | Last obs: rho=%.3f theta=%.3f",
-                n_lm, dim, sm, last.rho, last.theta);
+                "Line landmarks: %d | Corner landmarks: %d | State dim: %d | %s | "
+                "Last line: rho=%.3f theta=%.3f",
+                n_lines, n_corners, dim, sm, last.rho, last.theta);
         }
     }
 
@@ -702,10 +904,12 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr lines_dbg_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr corners_dbg_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr landmark_lines_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr landmark_corners_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     ekf_slam::LineExtractor line_extractor_;
     Eigen::Matrix2d         Q_line_;
+    Eigen::Matrix2d         Q_corner_;
 
     double last_odom_time_;
 
@@ -727,7 +931,8 @@ private:
     // Scan counter (for confirmation-buffer TTL and start-of-flight diag).
     unsigned long scans_seen_ = 0;
     // Throttle for the per-observation Mahalanobis diag (~1 Hz).
-    double last_diag_s_ = 0.0;
+    double last_diag_s_        = 0.0;
+    double last_corner_diag_s_ = 0.0;
 };
 
 int main(int argc, char** argv) {

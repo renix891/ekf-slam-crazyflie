@@ -87,7 +87,7 @@ void EKFCore::updateScanMatch(double dx, double dy, double dtheta, double match_
     nu(2) = normalizeAngle(dtheta - mu_(3));
 
     mu_    = mu_ + K * nu;
-    mu_(3) = normalizeAngle(mu_(3));
+    normalizeStateAngles();
 
     Sigma_ = (Eigen::MatrixXd::Identity(N, N) - K * H) * Sigma_;
 }
@@ -101,7 +101,7 @@ void EKFCore::updateYaw(double yaw_meas, double yaw_noise) {
     Eigen::VectorXd K = Sigma_.col(3) / S;
 
     mu_   += K * nu;
-    mu_(3) = normalizeAngle(mu_(3));
+    normalizeStateAngles();
 
     Sigma_ -= K * Sigma_.row(3);
 }
@@ -202,7 +202,50 @@ int EKFCore::augmentLineFromObservation(double rho_obs_r, double theta_obs_r,
     Eigen::MatrixXd cross_cov = Eigen::MatrixXd::Zero(2, N);
     cross_cov = J_pose * Sigma_.topRows<4>();
 
-    return augment(new_block, new_block_cov, cross_cov);
+    int idx = augment(new_block, new_block_cov, cross_cov);
+    kinds_.push_back(LandmarkKind::Line);
+    return idx;
+}
+
+int EKFCore::augmentCornerFromObservation(double cx_r, double cy_r,
+                                          const Eigen::Matrix2d& R_corner) {
+    // Inverse model: (cx_w, cy_w) = world pose + rotation(psi) * (cx_r, cy_r).
+    const double x   = mu_(0);
+    const double y   = mu_(1);
+    const double psi = mu_(3);
+    const double cs  = std::cos(psi);
+    const double sn  = std::sin(psi);
+
+    double cx_w = x + cs * cx_r - sn * cy_r;
+    double cy_w = y + sn * cx_r + cs * cy_r;
+
+    Eigen::VectorXd new_block(2);
+    new_block << cx_w, cy_w;
+
+    // J_pose = d(cx_w, cy_w) / d(x, y, z, psi).
+    Eigen::MatrixXd J_pose = Eigen::MatrixXd::Zero(2, 4);
+    J_pose(0, 0) = 1.0;
+    J_pose(0, 3) = -sn * cx_r - cs * cy_r;
+    J_pose(1, 1) = 1.0;
+    J_pose(1, 3) =  cs * cx_r - sn * cy_r;
+
+    // J_obs = d(cx_w, cy_w) / d(cx_r, cy_r) = R(psi).
+    Eigen::Matrix2d J_obs;
+    J_obs << cs, -sn,
+             sn,  cs;
+
+    Eigen::Matrix4d Sigma_pose = Sigma_.topLeftCorner<4, 4>();
+    Eigen::Matrix2d new_block_cov =
+        J_pose * Sigma_pose * J_pose.transpose() +
+        J_obs  * R_corner   * J_obs.transpose();
+
+    const int N = stateDim();
+    Eigen::MatrixXd cross_cov = Eigen::MatrixXd::Zero(2, N);
+    cross_cov = J_pose * Sigma_.topRows<4>();
+
+    int idx = augment(new_block, new_block_cov, cross_cov);
+    kinds_.push_back(LandmarkKind::Corner);
+    return idx;
 }
 
 void EKFCore::predictLineObservation(int landmark_idx,
@@ -245,10 +288,8 @@ bool EKFCore::updateLineLandmark(int landmark_idx,
 
     // Conditioning gate. After many updates against the same wall, the
     // landmark covariance shrinks; if S becomes near-singular S^-1 explodes
-    // and K * nu produces a huge state jump (we observed pose teleporting
-    // tens of meters out of the room). Skip the update so the filter stays
-    // bounded; the rho/Mahalanobis gates upstream will still let later
-    // observations correct the pose once Sigma has grown again.
+    // and K * nu produces a huge state jump. Skip the update so the filter
+    // stays bounded; later observations recover once Sigma has grown again.
     double det_S  = S.determinant();
     double norm_S = S.norm();
     if (!std::isfinite(det_S) || std::abs(det_S) < 1e-9 || norm_S < 1e-6) {
@@ -258,17 +299,85 @@ bool EKFCore::updateLineLandmark(int landmark_idx,
     Eigen::MatrixXd K = Sigma_ * H.transpose() * S.inverse();  // N x 2
 
     mu_ += K * nu;
-    mu_(3) = normalizeAngle(mu_(3));
-    // Re-canonicalize each line landmark's theta.
-    for (int j = 4; j + 1 < N; j += 2) {
-        // Heuristic: lines come in pairs only if we ever interleave with corners,
-        // but Stage 3 only adds line blocks. Treat every (rho, theta) pair as a
-        // line and wrap theta. Stage 4 will switch on layout.
-        mu_(j + 1) = normalizeAngle(mu_(j + 1));
-    }
+    normalizeStateAngles();
 
     Sigma_ = (Eigen::MatrixXd::Identity(N, N) - K * H) * Sigma_;
     return true;
+}
+
+void EKFCore::predictCornerObservation(int landmark_idx,
+                                       Eigen::Vector2d& z_pred,
+                                       Eigen::MatrixXd& H) const {
+    const int N      = stateDim();
+    const double x   = mu_(0);
+    const double y   = mu_(1);
+    const double psi = mu_(3);
+    const double cs  = std::cos(psi);
+    const double sn  = std::sin(psi);
+
+    const double cx_j = mu_(landmark_idx);
+    const double cy_j = mu_(landmark_idx + 1);
+
+    const double dx = cx_j - x;
+    const double dy = cy_j - y;
+
+    // Robot-frame corner: rotate world delta by -psi.
+    z_pred(0) =  cs * dx + sn * dy;
+    z_pred(1) = -sn * dx + cs * dy;
+
+    H = Eigen::MatrixXd::Zero(2, N);
+    // Pose columns
+    H(0, 0) = -cs;
+    H(0, 1) = -sn;
+    H(0, 3) = -sn * dx + cs * dy;   // = +z_pred(1)
+    H(1, 0) =  sn;
+    H(1, 1) = -cs;
+    H(1, 3) = -cs * dx - sn * dy;   // = -z_pred(0)
+    // Landmark columns
+    H(0, landmark_idx)     = +cs;
+    H(0, landmark_idx + 1) = +sn;
+    H(1, landmark_idx)     = -sn;
+    H(1, landmark_idx + 1) = +cs;
+}
+
+bool EKFCore::updateCornerLandmark(int landmark_idx,
+                                   double cx_r, double cy_r,
+                                   const Eigen::Matrix2d& R_corner) {
+    const int N = stateDim();
+    Eigen::Vector2d z_pred;
+    Eigen::MatrixXd H;
+    predictCornerObservation(landmark_idx, z_pred, H);
+
+    Eigen::Vector2d nu;
+    nu(0) = cx_r - z_pred(0);
+    nu(1) = cy_r - z_pred(1);
+
+    Eigen::Matrix2d S = H * Sigma_ * H.transpose() + R_corner;
+    double det_S  = S.determinant();
+    double norm_S = S.norm();
+    if (!std::isfinite(det_S) || std::abs(det_S) < 1e-9 || norm_S < 1e-6) {
+        return false;
+    }
+
+    Eigen::MatrixXd K = Sigma_ * H.transpose() * S.inverse();
+
+    mu_ += K * nu;
+    normalizeStateAngles();
+
+    Sigma_ = (Eigen::MatrixXd::Identity(N, N) - K * H) * Sigma_;
+    return true;
+}
+
+void EKFCore::normalizeStateAngles() {
+    // Wrap pose yaw.
+    mu_(3) = normalizeAngle(mu_(3));
+    // Wrap each line landmark's theta. Corners (cx, cy) are Cartesian — leave alone.
+    for (size_t k = 0; k < kinds_.size(); ++k) {
+        if (kinds_[k] == LandmarkKind::Line) {
+            int idx = 4 + 2 * static_cast<int>(k);
+            mu_(idx + 1) = normalizeAngle(mu_(idx + 1));
+        }
+    }
 }
 
 Eigen::Vector4d EKFCore::getPose() const {

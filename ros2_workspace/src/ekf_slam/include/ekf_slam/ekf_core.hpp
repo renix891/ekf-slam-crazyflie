@@ -2,8 +2,14 @@
 #define EKF_SLAM_EKF_CORE_HPP
 
 #include <Eigen/Dense>
+#include <vector>
 
 namespace ekf_slam {
+
+/// Tag for each 2-D landmark block stored in mu_/Sigma_ so the post-update
+/// normalization (which only wraps theta on line landmarks) can act on the
+/// right blocks.
+enum class LandmarkKind { Line, Corner };
 
 /**
  * @brief EKF localization core with a growable state vector.
@@ -89,6 +95,40 @@ public:
                                 Eigen::Vector2d& z_pred,
                                 Eigen::MatrixXd& H) const;
 
+    /**
+     * @brief Initialize a corner landmark from a robot-frame (cx_r, cy_r)
+     *        observation. Inverse model places the corner in world frame
+     *        using the current pose; J_pose / J_obs propagate covariance.
+     *        No canonicalization needed (corners are smooth Cartesian).
+     *
+     * @return Index in mu_ at which (cx_w, cy_w) begins.
+     */
+    int augmentCornerFromObservation(double cx_r, double cy_r,
+                                     const Eigen::Matrix2d& R_corner);
+
+    /**
+     * @brief Predicted robot-frame observation of an existing corner landmark
+     *        and the (m x stateDim) measurement Jacobian.
+     */
+    void predictCornerObservation(int landmark_idx,
+                                  Eigen::Vector2d& z_pred,
+                                  Eigen::MatrixXd& H) const;
+
+    /**
+     * @brief EKF correction from a robot-frame corner observation. Same
+     *        S-conditioning gate as updateLineLandmark.
+     */
+    bool updateCornerLandmark(int landmark_idx,
+                              double cx_r, double cy_r,
+                              const Eigen::Matrix2d& R_corner);
+
+    /// Kind of the k-th landmark block (0-indexed). Only valid for k in
+    /// [0, nLandmarks2()). Used by updates to decide whether the second slot
+    /// is an angle (line theta) or a Cartesian (corner cy).
+    LandmarkKind landmarkKind(int k) const {
+        return kinds_[static_cast<size_t>(k)];
+    }
+
     Eigen::Vector4d  getPose() const;            // pose block (x, y, z, theta)
     Eigen::Matrix4d  getPoseCovariance() const;  // top-left 4x4 of Sigma_
 
@@ -99,12 +139,19 @@ public:
 
     int stateDim()    const { return static_cast<int>(mu_.size()); }
     int nLandmarks2() const { return (stateDim() - 4) / 2; }  // # of 2-D landmark blocks
+    int nLines() const {
+        int n = 0; for (auto k : kinds_) if (k == LandmarkKind::Line) n++; return n;
+    }
+    int nCorners() const {
+        int n = 0; for (auto k : kinds_) if (k == LandmarkKind::Corner) n++; return n;
+    }
 
     static double normalizeAngle(double angle);
 
 private:
     Eigen::VectorXd mu_;     // dim = 4 + sum(landmark_block_sizes)
     Eigen::MatrixXd Sigma_;  // square, same dim as mu_
+    std::vector<LandmarkKind> kinds_;  // tag for each 2-D landmark block
 
     Eigen::Matrix4d R_;            // pose-block process noise (4x4)
     Eigen::Matrix3d Q_scanmatch_;  // (x, y, theta) scan-match noise
@@ -112,6 +159,10 @@ private:
     double commanded_vz_ = 0.0;
 
     Eigen::Matrix4d computePoseJacobian(double vx, double vy, double dt) const;
+
+    // Re-canonicalize angle entries after a state update. Wraps theta on
+    // line landmarks but leaves corner cy alone.
+    void normalizeStateAngles();
 };
 
 }  // namespace ekf_slam
