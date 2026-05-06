@@ -48,6 +48,7 @@ BAG_TOPICS = [
     '/crazyflie/odom',
     '/crazyflie/odom_noisy',
     '/crazyflie/scan',
+    '/crazyflie/range/down',
     '/ekf_pose',
     '/map',
     '/planned_path',

@@ -45,6 +45,7 @@ BAG_DIR = os.path.join(PROJECT_DIR, 'results', 'final_odom_bag')
 BAG_TOPICS = [
     '/crazyflie/odom',
     '/crazyflie/scan',
+    '/crazyflie/range/down',
     '/ekf_pose',
     '/map',
     '/planned_path',
