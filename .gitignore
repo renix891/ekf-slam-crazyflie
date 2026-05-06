@@ -19,5 +19,6 @@ results/**/*.db3
 results/gazebo_*_bag*/
 results/final_*_bag*/
 results/diagnostic/
+analysis/headline_bags/
 obsolete/
 
