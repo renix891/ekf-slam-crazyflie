@@ -1,0 +1,34 @@
+Final two-leg mission — EKF-SLAM vs noisy odometry baseline
+Outbound goal: (0.8, 0.0)    Return goal: (0.0, 0.0)
+======================================================================
+Metric                           EKF          Odom        Δ (Odom-EKF)
+----------------------------------------------------------------------
+Outbound landing **          4.86 cm       5.54 cm            +0.68 cm
+Outbound landing †           9.59 cm      16.27 cm            +6.68 cm
+Outbound bel-truth ‡         9.21 cm      10.76 cm            +1.55 cm
+Return landing **            3.09 cm       5.77 cm            +2.67 cm
+Return landing †             8.01 cm      17.00 cm            +8.99 cm
+Return bel-truth ‡          11.97 cm      19.09 cm            +7.12 cm
+Drift rate                0.074 cm/s    0.406 cm/s          +0.33 cm/s
+Outbound path eff.             0.106         0.181              +0.08 
+Return path eff.               0.115         0.270              +0.15 
+Outbound time                80.43 s       23.60 s            -56.83 s
+Return time                  75.09 s       15.86 s            -59.23 s
+Mission duration            161.01 s       47.00 s           -114.01 s
+----------------------------------------------------------------------
+** BELIEF view: /ekf_pose at the leg's landing sample, vs that leg's goal.
+†  TRUTH view:  /crazyflie/odom (Gazebo physics) at the same timestamp,
+                vs that leg's goal.
+‡  BEL-TRUTH = ‖belief − truth‖ at the leg's landing timestamp.
+
+Outbound landing positions (goal = (0.8, 0)):
+  EKF   belief: (0.762, 0.031) m   truth: (0.718, -0.050) m
+  Odom  belief: (0.783, -0.053) m   truth: (0.736, -0.150) m
+
+Return landing positions (goal = (0, 0)):
+  EKF   belief: (-0.005, -0.031) m   truth: (-0.079, -0.010) m
+  Odom  belief: (0.039, -0.042) m   truth: (-0.143, -0.091) m
+
+Trajectory C-space clip count (robot_radius=0.1 m):
+  EKF  : 313 / 1612 samples inside inflated obstacles
+  Odom : 775 / 2351 samples inside inflated obstacles

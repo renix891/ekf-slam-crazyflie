@@ -5,13 +5,17 @@ Two-leg mission:
   Leg 1 (outbound): takeoff → fly to (0.8, 0) → box-landing on the pad.
   Leg 2 (return):   takeoff → fly back to (0, 0) → straight-descend.
 
-Reads the bags produced by the final-experiment launch files:
-    results/final_ekf_bag/    (EKF-SLAM run, /ekf_pose = EKF output)
-    results/final_odom_bag/   (baseline, /ekf_pose = odom + Brownian drift)
+Reads the Run-2 headline safety copies (both contain /crazyflie/range/down):
+    analysis/headline_bags/final_ekf_bag_run2/    (EKF-SLAM run, /ekf_pose = EKF output)
+    analysis/headline_bags/final_odom_bag_run2/   (baseline, /ekf_pose = odom + Brownian drift)
+
+Each bag also carries /crazyflie/odom (Gazebo physics ground truth, untouched
+by the bridge) so we can report belief-vs-truth divergence alongside the
+controller-view "belief vs goal" landing metric.
 
 Outputs:
-    results/nav_comparison_trajectories.png  — trajectories colour-coded by leg
-    results/nav_comparison_summary.txt       — table (EKF vs Odom)
+    results/figures/nav_comparison_trajectories.png  — trajectories colour-coded by leg
+    results/figures/nav_comparison_summary.txt       — table (EKF vs Odom)
 
 Primary metric: RETURN-LEG landing distance vs (0, 0). The phantom-centroid
 proof — odometry's accumulated drift means the "I'm back at the origin"
@@ -34,14 +38,16 @@ import rosbag2_py
 
 
 PROJECT_DIR = '/home/renix/EKF-SLAM-Autonomous-Crazyflie'
-RESULTS_DIR = os.path.join(PROJECT_DIR, 'results')
-EKF_BAG  = os.path.join(RESULTS_DIR, 'final_ekf_bag')
-ODOM_BAG = os.path.join(RESULTS_DIR, 'final_odom_bag')
+HEADLINE_BAGS_DIR = os.path.join(PROJECT_DIR, 'analysis', 'headline_bags')
+FIGURES_DIR = os.path.join(PROJECT_DIR, 'results', 'figures')
+EKF_BAG  = os.path.join(HEADLINE_BAGS_DIR, 'final_ekf_bag_run2')
+ODOM_BAG = os.path.join(HEADLINE_BAGS_DIR, 'final_odom_bag_run2')
 
 POSE_TOPIC   = '/ekf_pose'
+TRUTH_TOPIC  = '/crazyflie/odom'   # Gazebo physics ground truth (nav_msgs/Odometry)
 OUTBOUND_GOAL = (0.8, 0.0)
 RETURN_GOAL   = (0.0, 0.0)
-LAND_Z   = 0.05    # m — anything below this is "landed"
+LAND_Z   = 0.10    # m — anything below this is "landed" (outbound pad lands ~0.06–0.07; return ~0.04–0.06)
 TAKEOFF_Z = 0.20   # m — anything above this is "in the air"
 
 # C-space (mirrors the existing visualisation).
@@ -113,6 +119,35 @@ def read_pose_xyz(bag_path):
         ys.append(p.y)
         zs.append(p.z)
     return np.array(ts), np.array(xs), np.array(ys), np.array(zs)
+
+
+def read_odom_xyz(bag_path):
+    """Return (times_s, xs, ys, zs) for /crazyflie/odom (truth), sorted by time."""
+    storage = rosbag2_py.StorageOptions(uri=bag_path, storage_id='mcap')
+    converter = rosbag2_py.ConverterOptions('', '')
+    reader = rosbag2_py.SequentialReader()
+    reader.open(storage, converter)
+
+    type_map = {t.name: t.type for t in reader.get_all_topics_and_types()}
+    if TRUTH_TOPIC not in type_map:
+        raise RuntimeError(f"{TRUTH_TOPIC} not found in {bag_path}")
+    MsgType = get_message(type_map[TRUTH_TOPIC])
+
+    ts, xs, ys, zs = [], [], [], []
+    while reader.has_next():
+        topic, data, _t_ns = reader.read_next()
+        if topic != TRUTH_TOPIC:
+            continue
+        msg = deserialize_message(data, MsgType)
+        h = msg.header.stamp
+        ts.append(h.sec + h.nanosec * 1e-9)
+        p = msg.pose.pose.position
+        xs.append(p.x)
+        ys.append(p.y)
+        zs.append(p.z)
+    order = np.argsort(ts)
+    return (np.array(ts)[order], np.array(xs)[order],
+            np.array(ys)[order], np.array(zs)[order])
 
 
 def detect_legs(t, z) -> List[Tuple[int, int]]:
@@ -209,6 +244,76 @@ def main():
     print(f"Reading Odom : {ODOM_BAG}")
     odom_t, odom_x, odom_y, odom_z = read_pose_xyz(ODOM_BAG)
 
+    # Ground truth from /crazyflie/odom (Gazebo physics, untouched by bridge).
+    # Used only for the additional summary metrics; leg detection and plotting
+    # continue to use /ekf_pose as before.
+    ekf_truth_t,  ekf_truth_x,  ekf_truth_y,  _ = read_odom_xyz(EKF_BAG)
+    odom_truth_t, odom_truth_x, odom_truth_y, _ = read_odom_xyz(ODOM_BAG)
+
+    def belief_truth_metrics(belief_t, belief_x, belief_y,
+                             truth_t, truth_x, truth_y):
+        """Belief vs truth at the final belief sample, plus drift rate.
+
+        Returns dict with:
+          belief_final     : (x, y) of /ekf_pose final sample
+          truth_final      : (x, y) of /crazyflie/odom final sample
+          physical_dist_m  : ‖truth_final − (0, 0)‖
+          belief_truth_m   : ‖belief_final − truth-interpolated-to-belief-t‖
+          duration_s       : belief_t[-1] − belief_t[0]
+          drift_rate_cm_s  : belief_truth_m·100 / duration_s
+        """
+        bx, by = float(belief_x[-1]), float(belief_y[-1])
+        tx_at  = float(np.interp(belief_t[-1], truth_t, truth_x))
+        ty_at  = float(np.interp(belief_t[-1], truth_t, truth_y))
+        physical_dist = float(np.hypot(truth_x[-1], truth_y[-1]))
+        belief_truth  = float(np.hypot(bx - tx_at, by - ty_at))
+        duration      = float(belief_t[-1] - belief_t[0]) if len(belief_t) > 1 else 0.0
+        drift_rate    = belief_truth * 100.0 / duration if duration > 0 else float('nan')
+        return {
+            'belief_final':    (bx, by),
+            'truth_final':     (float(truth_x[-1]), float(truth_y[-1])),
+            'physical_dist_m': physical_dist,
+            'belief_truth_m':  belief_truth,
+            'duration_s':      duration,
+            'drift_rate_cm_s': drift_rate,
+        }
+
+    ekf_bt  = belief_truth_metrics(ekf_t,  ekf_x,  ekf_y,
+                                   ekf_truth_t,  ekf_truth_x,  ekf_truth_y)
+    odom_bt = belief_truth_metrics(odom_t, odom_x, odom_y,
+                                   odom_truth_t, odom_truth_x, odom_truth_y)
+
+    def outbound_truth_metrics(belief_t, belief_x, belief_y, leg_idx,
+                               truth_t, truth_x, truth_y, goal):
+        """Truth-side outbound landing, evaluated at the belief-side leg-end timestamp.
+
+        Returns dict with:
+          belief_xy        : (x, y) of /ekf_pose at outbound landing
+          truth_xy         : (x, y) of /crazyflie/odom at the same t
+          truth_dist_m     : ‖truth_xy − goal‖
+          belief_truth_m   : ‖belief_xy − truth_xy‖
+        Or NaN-filled dict if no outbound leg.
+        """
+        nan_dict = {'belief_xy': (float('nan'), float('nan')),
+                    'truth_xy':  (float('nan'), float('nan')),
+                    'truth_dist_m': float('nan'),
+                    'belief_truth_m': float('nan')}
+        if leg_idx is None:
+            return nan_dict
+        _s, e = leg_idx
+        bx, by = float(belief_x[e]), float(belief_y[e])
+        t_at   = float(belief_t[e])
+        tx_at  = float(np.interp(t_at, truth_t, truth_x))
+        ty_at  = float(np.interp(t_at, truth_t, truth_y))
+        truth_dist    = float(np.hypot(tx_at - goal[0], ty_at - goal[1]))
+        belief_truth  = float(np.hypot(bx - tx_at, by - ty_at))
+        return {
+            'belief_xy':      (bx, by),
+            'truth_xy':       (tx_at, ty_at),
+            'truth_dist_m':   truth_dist,
+            'belief_truth_m': belief_truth,
+        }
+
     ekf_legs  = detect_legs(ekf_t,  ekf_z)
     odom_legs = detect_legs(odom_t, odom_z)
     print(f"  EKF legs detected  : {len(ekf_legs)}")
@@ -225,6 +330,15 @@ def main():
                                  leg_or_none(odom_legs, 0), OUTBOUND_GOAL)
     odom_ret = leg_landing_stats('Odom return',   odom_t, odom_x, odom_y, odom_z,
                                  leg_or_none(odom_legs, 1), RETURN_GOAL)
+
+    ekf_out_bt  = outbound_truth_metrics(ekf_t,  ekf_x,  ekf_y,
+                                         leg_or_none(ekf_legs,  0),
+                                         ekf_truth_t,  ekf_truth_x,  ekf_truth_y,
+                                         OUTBOUND_GOAL)
+    odom_out_bt = outbound_truth_metrics(odom_t, odom_x, odom_y,
+                                         leg_or_none(odom_legs, 0),
+                                         odom_truth_t, odom_truth_x, odom_truth_y,
+                                         OUTBOUND_GOAL)
 
     ekf_eff_out  = path_efficiency(ekf_t,  ekf_x,  ekf_y,  leg_or_none(ekf_legs,  0),
                                    (0.0, 0.0), OUTBOUND_GOAL)
@@ -246,6 +360,7 @@ def main():
     def fmt_m(v): return f"{v*100:7.2f} cm" if not np.isnan(v) else '   N/A   '
     def fmt_eff(v): return f"{v:6.3f}" if not np.isnan(v) else '  N/A '
     def fmt_s(v): return f"{v:6.2f} s" if not np.isnan(v) else '   N/A  '
+    def fmt_rate(v): return f"{v:6.3f} cm/s" if not np.isnan(v) else '   N/A    '
 
     summary = []
     summary.append("Final two-leg mission — EKF-SLAM vs noisy odometry baseline")
@@ -260,22 +375,40 @@ def main():
                   if not (np.isnan(ekf_v) or np.isnan(odom_v)) else '    N/A    ')
         summary.append(f"{name:<22}{fmt(ekf_v):>14}{fmt(odom_v):>14}{de_str:>20}")
 
-    row("Outbound landing",   ekf_out['goal_dist'],   odom_out['goal_dist'], fmt_m)
+    row("Outbound landing **", ekf_out['goal_dist'],   odom_out['goal_dist'], fmt_m)
+    row("Outbound landing †",  ekf_out_bt['truth_dist_m'], odom_out_bt['truth_dist_m'], fmt_m)
+    row("Outbound bel-truth ‡", ekf_out_bt['belief_truth_m'], odom_out_bt['belief_truth_m'], fmt_m)
     row("Return landing **",  ekf_ret['goal_dist'],   odom_ret['goal_dist'], fmt_m)
+    row("Return landing †",   ekf_bt['physical_dist_m'], odom_bt['physical_dist_m'], fmt_m)
+    row("Return bel-truth ‡", ekf_bt['belief_truth_m'], odom_bt['belief_truth_m'], fmt_m)
+    row("Drift rate",         ekf_bt['drift_rate_cm_s'], odom_bt['drift_rate_cm_s'],
+        fmt_rate, sign_label='cm/s')
     row("Outbound path eff.", ekf_eff_out, odom_eff_out, fmt_eff, sign_label='')
     row("Return path eff.",   ekf_eff_ret, odom_eff_ret, fmt_eff, sign_label='')
     row("Outbound time",      ekf_out['duration_s'], odom_out['duration_s'],
         fmt_s, sign_label='s')
     row("Return time",        ekf_ret['duration_s'], odom_ret['duration_s'],
         fmt_s, sign_label='s')
+    row("Mission duration",   ekf_bt['duration_s'], odom_bt['duration_s'],
+        fmt_s, sign_label='s')
 
     summary.append("-" * 70)
-    summary.append("** RETURN LANDING is the primary metric — phantom-centroid proof.")
+    summary.append("** BELIEF view: /ekf_pose at the leg's landing sample, vs that leg's goal.")
+    summary.append("†  TRUTH view:  /crazyflie/odom (Gazebo physics) at the same timestamp,")
+    summary.append("                vs that leg's goal.")
+    summary.append("‡  BEL-TRUTH = ‖belief − truth‖ at the leg's landing timestamp.")
     summary.append("")
-    summary.append(f"Final EKF return pose:   ({ekf_ret['final_x']:.3f}, "
-                   f"{ekf_ret['final_y']:.3f}) m")
-    summary.append(f"Final Odom return pose:  ({odom_ret['final_x']:.3f}, "
-                   f"{odom_ret['final_y']:.3f}) m")
+    summary.append("Outbound landing positions (goal = (0.8, 0)):")
+    summary.append(f"  EKF   belief: ({ekf_out['final_x']:.3f}, {ekf_out['final_y']:.3f}) m   "
+                   f"truth: ({ekf_out_bt['truth_xy'][0]:.3f}, {ekf_out_bt['truth_xy'][1]:.3f}) m")
+    summary.append(f"  Odom  belief: ({odom_out['final_x']:.3f}, {odom_out['final_y']:.3f}) m   "
+                   f"truth: ({odom_out_bt['truth_xy'][0]:.3f}, {odom_out_bt['truth_xy'][1]:.3f}) m")
+    summary.append("")
+    summary.append("Return landing positions (goal = (0, 0)):")
+    summary.append(f"  EKF   belief: ({ekf_ret['final_x']:.3f}, {ekf_ret['final_y']:.3f}) m   "
+                   f"truth: ({ekf_bt['truth_final'][0]:.3f}, {ekf_bt['truth_final'][1]:.3f}) m")
+    summary.append(f"  Odom  belief: ({odom_ret['final_x']:.3f}, {odom_ret['final_y']:.3f}) m   "
+                   f"truth: ({odom_bt['truth_final'][0]:.3f}, {odom_bt['truth_final'][1]:.3f}) m")
     summary.append("")
     summary.append("Trajectory C-space clip count "
                    f"(robot_radius={ROBOT_RADIUS} m):")
@@ -285,8 +418,8 @@ def main():
     text = "\n".join(summary)
     print(text)
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    out_txt = os.path.join(RESULTS_DIR, 'nav_comparison_summary.txt')
+    os.makedirs(FIGURES_DIR, exist_ok=True)
+    out_txt = os.path.join(FIGURES_DIR, 'nav_comparison_summary.txt')
     with open(out_txt, 'w') as f:
         f.write(text + '\n')
 
@@ -311,9 +444,9 @@ def main():
     plot_legs('EKF',  ekf_x,  ekf_y,  ekf_legs,  'C0')
     plot_legs('Odom', odom_x, odom_y, odom_legs, 'C3')
 
-    ax.plot(*OUTBOUND_GOAL, '*', color='gold', markersize=22,
+    ax.plot(*OUTBOUND_GOAL, '*', color='gold', markersize=14,
             markeredgecolor='black', zorder=6, label='Outbound goal (pad)')
-    ax.plot(*RETURN_GOAL, 'P', color='lime', markersize=18,
+    ax.plot(*RETURN_GOAL, 'P', color='lime', markersize=12,
             markeredgecolor='black', zorder=6, label='Return goal (origin)')
 
     ax.set_xlim(*CSPACE_BOUNDS[0:2])
@@ -329,7 +462,7 @@ def main():
     ax.legend(loc='upper right', fontsize=8)
 
     fig.tight_layout()
-    out_png = os.path.join(RESULTS_DIR, 'nav_comparison_trajectories.png')
+    out_png = os.path.join(FIGURES_DIR, 'nav_comparison_trajectories.png')
     fig.savefig(out_png, dpi=150)
     print(f"\nSaved plot:    {out_png}")
     print(f"Saved summary: {out_txt}")
