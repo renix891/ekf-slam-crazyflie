@@ -1,0 +1,36 @@
+SLAM error report — EKF-corrected vs raw odometry (Run 2 headline bags)
+
+Ground truth obstacle_4 centre: (0.40, 0.00) m, size 0.30 m
+Outbound goal: (0.8, 0.0)    Return goal: (0.0, 0.0)    Robot radius: 0.10 m
+
+Bag-wide metrics
+  Metric                          EKF               Odom-Only         
+  --------------------------------------------------------------------
+  Obstacle surface RMS            0.051 m           0.051 m           
+    (n hits inside window)        1310              346               
+    (legs detected, truth z)      2                 2                 
+
+Outbound leg  — start (0,0) → goal (0.8, 0.0)
+  Metric                          EKF               Odom-Only         
+  --------------------------------------------------------------------
+  Path efficiency (straight/actual)0.711             0.760             
+  Time-fraction in C-obs          11.7%             24.5%             
+    (seconds inside)              9.5 s             5.8 s             
+  Duration (truth)                80.8 s            23.6 s            
+  Landing error — truth           0.096 m           0.163 m           
+  Landing error — belief          0.053 m           0.056 m           
+
+Return leg    — start (0.8, 0) → goal (0.0, 0.0)
+  Metric                          EKF               Odom-Only         
+  --------------------------------------------------------------------
+  Path efficiency (straight/actual)0.620             0.766             
+  Time-fraction in C-obs          0.7%              0.9%              
+    (seconds inside)              0.5 s             0.1 s             
+  Duration (truth)                75.1 s            15.9 s            
+  Landing error — truth           0.080 m           0.170 m           
+  Landing error — belief          0.024 m           0.058 m           
+
+Notes:
+  Obstacle RMS uses belief-frame scan projection — that is the localization-error signal.
+  Path efficiency, C-obs fraction, duration, and landing-truth are truth-frame.
+  Landing-belief = ‖belief_xy(at truth-leg-end-t) − leg_goal‖, controller-view.
