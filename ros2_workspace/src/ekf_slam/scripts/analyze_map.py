@@ -11,14 +11,12 @@ Outputs (all in results/figures/):
     map_occupancy_odom.png       — dot-grid occupancy + trajectory, Odom Run 2
     map_scan_endpoints_ekf.png   — scan endpoints + GT overlay, EKF Run 2
     map_scan_endpoints_odom.png  — scan endpoints + GT overlay, Odom Run 2
-    map_line_extraction_ekf.png  — IEPF + TLS line segments + GT overlay, EKF
-    map_line_extraction_odom.png — IEPF + TLS line segments + GT overlay, Odom
     map_landmarks_ekf.png        — final EKF tracked landmarks + GT overlay
 
 All bag-comparison figures share COMMON_BOUNDS so wall thickness / smear is
 directly eyeball-comparable. Ground-truth obstacle/wall outlines (from the
-SDF) overlay the scan-endpoint, line-extraction, and landmark figures so
-"is dispersion real or drift?" reads visually.
+SDF) overlay the scan-endpoint and landmark figures so "is dispersion real
+or drift?" reads visually.
 """
 
 import os
@@ -441,167 +439,6 @@ def plot_scan_endpoints(label, poses, scans, out_path):
     print(f"  wrote {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# Line extraction: cluster_points -> split_and_merge (IEPF) -> TLS -> segment
-#
-# Direct port of midterm Problem 2 (Downloads/MIDTERM/Problem 2/Problem2.py).
-# Points are processed in the sequential order they were generated (one scan
-# at a time, beams in fixed angular order) so that consecutive distance is a
-# meaningful proxy for "this point and the next likely came off the same
-# surface". A point is just a point — beams don't matter.
-# ---------------------------------------------------------------------------
-
-CLUSTER_DIST = 0.30      # m, sequential gap that breaks a cluster
-IEPF_THRESH = 0.15       # m, max perpendicular distance before splitting at a corner
-MIN_CLUSTER_PTS = 6      # min points to bother fitting a line
-
-
-def cluster_points(points, distance_threshold):
-    if len(points) == 0:
-        return []
-    clusters = []
-    current = [points[0]]
-    for i in range(1, len(points)):
-        d = np.linalg.norm(points[i] - points[i - 1])
-        if d > distance_threshold:
-            clusters.append(np.array(current))
-            current = []
-        current.append(points[i])
-    if current:
-        clusters.append(np.array(current))
-    return clusters
-
-
-def split_and_merge(cluster, threshold):
-    if len(cluster) <= 2:
-        return [cluster]
-
-    start_p = cluster[0]
-    end_p = cluster[-1]
-    line_vec = end_p - start_p
-    line_len = np.linalg.norm(line_vec)
-    if line_len == 0.0:
-        return [cluster]
-
-    point_vecs = cluster - start_p
-    cross = np.abs(point_vecs[:, 0] * line_vec[1] - point_vecs[:, 1] * line_vec[0])
-    distances = cross / line_len
-
-    max_idx = int(np.argmax(distances))
-    max_dist = float(distances[max_idx])
-
-    if max_dist > threshold:
-        left = split_and_merge(cluster[:max_idx + 1], threshold)
-        right = split_and_merge(cluster[max_idx:], threshold)
-        return left + right
-    return [cluster]
-
-
-def total_least_squares(cluster):
-    x = cluster[:, 0]
-    y = cluster[:, 1]
-    mean_x = float(np.mean(x))
-    mean_y = float(np.mean(y))
-
-    A = np.array([
-        [np.mean(x * x), np.mean(x * y)],
-        [np.mean(x * y), np.mean(y * y)],
-    ])
-    b = np.array([[mean_x], [mean_y]])
-    D = A - b @ b.T
-    eigvals, eigvecs = np.linalg.eigh(D)
-    n = eigvecs[:, int(np.argmin(eigvals))]
-    n0 = float((b.T @ n)[0])
-    return n, n0
-
-
-def get_line_segment(cluster, n, n0):
-    direction = np.array([n[1], -n[0]])
-    projections = cluster @ direction
-    min_idx = int(np.argmin(projections))
-    max_idx = int(np.argmax(projections))
-
-    def project(p):
-        dist = float(p @ n - n0)
-        return p - dist * n
-
-    return project(cluster[min_idx]), project(cluster[max_idx])
-
-
-def plot_line_extraction(label, poses, scans, out_path):
-    sx, sy, si, st = beam_endpoints_world(poses, scans)
-
-    fig, ax = plt.subplots(figsize=(9, 9))
-
-    grid = classify_dot_grid(poses, scans, resolution=OCC_RES)
-    if grid is not None:
-        free_xy, occ_xy, *_ = grid
-        _draw_dot_grid(ax, free_xy, occ_xy, free_size=4, occ_size=8,
-                       free_alpha=0.35, occ_alpha=0.45, zorder=1)
-
-    if sx.size:
-        ax.scatter(sx, sy, c='dimgray', s=4, alpha=0.5, zorder=2,
-                   label='Noisy Point Cloud')
-
-        # The midterm's cluster_points assumes consecutive points came off
-        # the same surface — true for a single dense angular sweep, but our
-        # data is sparse 4-beam scans where adjacent entries in the array
-        # typically point at different walls. To recover the "consecutive ==
-        # same surface" property, feed each beam direction as its own
-        # ordered stream (one beam slides continuously along one wall as
-        # the drone moves). All resulting clusters from all beams pool
-        # together for IEPF/TLS.
-        points = np.column_stack([sx, sy])
-        initial = []
-        for beam in np.unique(si):
-            mask = si == beam
-            order = np.argsort(st[mask])
-            stream = points[mask][order]
-            initial.extend(cluster_points(stream, CLUSTER_DIST))
-
-        refined = []
-        for c in initial:
-            refined.extend(split_and_merge(c, IEPF_THRESH))
-
-        segments = []
-        for c in refined:
-            if len(c) < MIN_CLUSTER_PTS:
-                continue
-            n, n0 = total_least_squares(c)
-            p1, p2 = get_line_segment(c, n, n0)
-            segments.append((p1, p2))
-
-        for i, (p1, p2) in enumerate(segments):
-            lbl = 'Reconstructed Segment' if i == 0 else None
-            ax.plot([p1[0], p2[0]], [p1[1], p2[1]],
-                    color='red', linewidth=2, zorder=4, label=lbl)
-
-        print(f"  initial clusters: {len(initial)}  "
-              f"after IEPF: {len(refined)}  fitted segments: {len(segments)}")
-
-    if poses['x'].size:
-        ax.plot(poses['x'], poses['y'], '-', color='rebeccapurple', lw=1.2,
-                zorder=3, label='Trajectory')
-        ax.plot(poses['x'][0], poses['y'][0], 'o', color='rebeccapurple',
-                markersize=6, zorder=5, label='Start')
-    _draw_world_geometry(ax, alpha=0.4, zorder=2)
-    _draw_goals(ax)
-
-    ax.set_xlim(COMMON_BOUNDS[0], COMMON_BOUNDS[1])
-    ax.set_ylim(COMMON_BOUNDS[2], COMMON_BOUNDS[3])
-    ax.set_xlabel('x [m]')
-    ax.set_ylabel('y [m]')
-    ax.set_title(f'Extracted Wall/Obstacle Lines — {label}')
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right', fontsize=8)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  wrote {out_path}")
-
-
 def plot_ekf_landmarks(label, bag_path, out_path):
     """Final state of /ekf_slam/debug/landmark_lines, plus GT overlay.
 
@@ -679,9 +516,6 @@ def main():
         plot_scan_endpoints(
             label, poses, scans,
             os.path.join(FIGURES_DIR, f'map_scan_endpoints_{suffix}.png'))
-        plot_line_extraction(
-            label, poses, scans,
-            os.path.join(FIGURES_DIR, f'map_line_extraction_{suffix}.png'))
 
     print(f"Reading EKF landmarks: {HEADLINE_EKF_BAG}")
     plot_ekf_landmarks(
