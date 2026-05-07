@@ -1,0 +1,20 @@
+ATE/RPE summary — Run 2, Δ=1.0s, translation-only
+
+EKF Run 2 (final_ekf_bag_run2/)
+  ATE  : RMSE = 0.114 m   mean = 0.104 m   max = 0.217 m   (n=1612 samples)
+  RPE  : RMSE = 0.035 m   mean = 0.030 m   max = 0.107 m   (n=1601 windows)
+
+Odom Run 2 (final_odom_bag_run2/)
+  ATE  : RMSE = 0.121 m   mean = 0.108 m   max = 0.209 m   (n=2349 samples)
+  RPE  : RMSE = 0.026 m   mean = 0.022 m   max = 0.075 m   (n=2299 windows)
+
+Notes:
+  ATE = ‖belief_xy(t) − truth_xy(t)‖ at every belief sample,
+        truth interpolated onto belief timestamps.
+  RPE = ‖Δbelief − Δtruth‖ over a 1.0s window;
+        only windows fully inside the truth time range are used.
+  Translation-only — orientation error not included.
+  Sample-count asymmetry: the EKF flight is much longer than the
+  odom flight, so the EKF distribution is estimated from more
+  windows. Compare RMSE/mean for cross-bag conclusions; raw
+  histogram counts are not directly comparable.
