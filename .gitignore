@@ -12,6 +12,7 @@ __pycache__/
 CMakeCache.txt
 .vscode/
 *.png
+!results/figures/*.png
 results/**/*.mcap
 results/**/*.db3
 **/metadata.yaml
