@@ -1,0 +1,20 @@
+EKF innovation summary — Run 2 (EKF bag only)
+
+z innovation (down-range vs belief z) [m]
+  pre-update rejected (envelope, NaN, floor-obstacle) : 40
+  gated-in  (applied to filter): RMSE = 0.0037   mean = -0.0006   max|nu| = 0.0472   n = 1572
+  gated-out (live |nu|>thresh) : RMSE = nan   mean = +nan   max|nu| = nan   n = 0
+
+yaw innovation (odom yaw vs belief yaw) [rad]
+  every-tick (no live gate)    : RMSE = 0.00243   mean = -0.00086   max|nu| = 0.02295   n = 8061
+
+Notes:
+  z thresholds vary by drone state (ekf_core.cpp updateZ):
+    μ_z < 0.10 m              → |nu| < 0.50
+    |commanded vz| > 0.05    → |nu| < 0.40
+    hover                       → |nu| < 0.10
+  z innovation reconstructs the live z_est test approximately by
+  interpolating belief z onto the down-range timestamp.
+  yaw is updated every odom tick (~50 Hz) with no magnitude gate.
+  Sample rates: down-range ~10 Hz, odom ~50 Hz — yaw subplot is
+  much denser than the z subplot.
