@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
-"""Visualize the latest EKF-run bag: occupancy map + raw scans + extracted lines.
+"""Render the headline-run map figures for both Run 2 bags.
 
-Inputs:
-    results/gazebo_full_nav_ekf_bag/   (must contain /map, /ekf_pose, /crazyflie/scan)
+Inputs (Run 2 headline bags, each contains /map, /ekf_pose, /crazyflie/scan,
+and the EKF bag also contains /ekf_slam/debug/landmark_lines):
+    analysis/headline_bags/final_ekf_bag_run2/
+    analysis/headline_bags/final_odom_bag_run2/
 
-Outputs:
-    results/occupancy_map.png
-    results/scan_endpoints.png
-    results/line_extraction.png
+Outputs (all in results/figures/):
+    map_occupancy_ekf.png        — dot-grid occupancy + trajectory, EKF Run 2
+    map_occupancy_odom.png       — dot-grid occupancy + trajectory, Odom Run 2
+    map_scan_endpoints_ekf.png   — scan endpoints + GT overlay, EKF Run 2
+    map_scan_endpoints_odom.png  — scan endpoints + GT overlay, Odom Run 2
+    map_line_extraction_ekf.png  — IEPF + TLS line segments + GT overlay, EKF
+    map_line_extraction_odom.png — IEPF + TLS line segments + GT overlay, Odom
+    map_landmarks_ekf.png        — final EKF tracked landmarks + GT overlay
+
+All bag-comparison figures share COMMON_BOUNDS so wall thickness / smear is
+directly eyeball-comparable. Ground-truth obstacle/wall outlines (from the
+SDF) overlay the scan-endpoint, line-extraction, and landmark figures so
+"is dispersion real or drift?" reads visually.
 """
 
 import os
@@ -17,7 +28,6 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
 
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
@@ -25,10 +35,32 @@ import rosbag2_py
 
 
 PROJECT_DIR = '/home/renix/EKF-SLAM-Autonomous-Crazyflie'
-RESULTS_DIR = os.path.join(PROJECT_DIR, 'results')
-BAG = os.path.join(RESULTS_DIR, 'gazebo_full_nav_ekf_bag')
+HEADLINE_BAGS_DIR = os.path.join(PROJECT_DIR, 'analysis', 'headline_bags')
+HEADLINE_EKF_BAG  = os.path.join(HEADLINE_BAGS_DIR, 'final_ekf_bag_run2')
+HEADLINE_ODOM_BAG = os.path.join(HEADLINE_BAGS_DIR, 'final_odom_bag_run2')
+FIGURES_DIR = os.path.join(PROJECT_DIR, 'results', 'figures')
 
-GOAL = (0.8, 0.0)
+OUTBOUND_GOAL = (0.8, 0.0)
+RETURN_GOAL   = (0.0, 0.0)
+
+# Shared axis window for the two occupancy maps and the two scan-endpoint
+# maps so wall-thickness / smear is visually comparable across bags.
+COMMON_BOUNDS = (-2.2, 2.2, -2.2, 2.2)
+
+# Ground-truth boxes from crazyflie_world.sdf (4 walls + 4 obstacles).
+# Format: (xmin, xmax, ymin, ymax, kind). Landing pad is intentionally
+# absent — it sits at z=0–0.05 m, below the multiranger scan plane, so
+# drawing it would mis-imply scans should hit it.
+WORLD_GEOMETRY_BOXES = [
+    (1.95,  2.05, -2.0,   2.0,  'wall'),    # wall_east
+    (-2.05, -1.95, -2.0,  2.0,  'wall'),    # wall_west
+    (-2.0,  2.0,   1.95,  2.05, 'wall'),    # wall_north
+    (-2.0,  2.0,  -2.05, -1.95, 'wall'),    # wall_south
+    (0.4,   0.6,   0.4,   0.6,  'obstacle'),  # obstacle_1
+    (-0.6, -0.4,   0.2,   0.4,  'obstacle'),  # obstacle_2
+    (0.1,   0.3,  -0.7,  -0.5,  'obstacle'),  # obstacle_3
+    (0.25,  0.55, -0.15,  0.15, 'obstacle'),  # obstacle_4
+]
 
 # Matches the EKF/mapper convention: [back, right, front, left]
 BEAM_BEARINGS = np.array([np.pi, -np.pi / 2.0, 0.0, np.pi / 2.0])
@@ -114,18 +146,11 @@ MAX_LOG_ODDS = 30.0
 
 
 def build_occupancy_from_scans(poses, scans, resolution=OCC_RES, margin=0.5):
-    """Reconstruct an occupancy grid from the trajectory and laser scans.
-
-    Mirrors OceanMapper.update_from_lidar: each beam endpoint marks its cell
-    occupied (+L_OCC), and cells along the ray from drone to endpoint are
-    marked free (+L_FREE) using a Bresenham-style step. Returns
-    (prob_map, x_min, y_min, resolution)."""
+    """Reconstruct an occupancy grid from the trajectory and laser scans."""
     sx, sy, _, st = beam_endpoints_world(poses, scans)
     if sx.size == 0:
         return None
 
-    # Tight grid bounds: span the trajectory and the endpoint cloud, plus a
-    # small margin so we don't clip walls right at the edge.
     all_x = np.concatenate([poses['x'], sx])
     all_y = np.concatenate([poses['y'], sy])
     x_min = float(all_x.min()) - margin
@@ -137,8 +162,6 @@ def build_occupancy_from_scans(poses, scans, resolution=OCC_RES, margin=0.5):
     ny = int(np.ceil((y_max - y_min) / resolution))
     log_odds = np.zeros((ny, nx))
 
-    # Pose lookup by timestamp — same nearest-neighbour scheme as
-    # beam_endpoints_world; we need the drone position for ray tracing.
     pt = poses['t']
     px = poses['x']
     py = poses['y']
@@ -154,8 +177,6 @@ def build_occupancy_from_scans(poses, scans, resolution=OCC_RES, margin=0.5):
     for hx, hy, t in zip(sx, sy, st):
         rx, ry = _pose_at(t)
 
-        # Mark ray cells as free (cells the beam passed through). Step about
-        # 0.8 of a cell at a time so we don't skip cells on diagonal beams.
         ray_len = np.hypot(hx - rx, hy - ry)
         n_samples = max(1, int(ray_len / (resolution * 0.8)))
         for k in range(n_samples):
@@ -168,8 +189,6 @@ def build_occupancy_from_scans(poses, scans, resolution=OCC_RES, margin=0.5):
                 log_odds[jy, jx] += L_FREE
                 log_odds[jy, jx]  = max(log_odds[jy, jx], -MAX_LOG_ODDS)
 
-        # Mark the hit cell as occupied — done after the ray pass so an
-        # endpoint is never overwritten by its own ray's free update.
         ix = int((hx - x_min) / resolution)
         iy = int((hy - y_min) / resolution)
         if 0 <= ix < nx and 0 <= iy < ny:
@@ -181,10 +200,7 @@ def build_occupancy_from_scans(poses, scans, resolution=OCC_RES, margin=0.5):
 
 
 def classify_dot_grid(poses, scans, resolution=OCC_RES):
-    """Return (free_xy, occ_xy, x_min, y_min, res) — the C-space dot grid
-    in the midterm Problem 3 / Problem 4 style. A cell is 'occupied' if its
-    log-odds ended above 0 (more endpoints than ray-throughs) and 'free' if
-    below 0. Cells that no ray ever touched stay 'unknown' and get no dot."""
+    """Return (free_xy, occ_xy, x_min, y_min, res, nx, ny)."""
     result = build_occupancy_from_scans(poses, scans, resolution=resolution)
     if result is None:
         return None
@@ -195,7 +211,6 @@ def classify_dot_grid(poses, scans, resolution=OCC_RES):
     cx = x_min + (ix + 0.5) * res
     cy = y_min + (iy + 0.5) * res
 
-    # Cells where any update happened: prob != 0.5 (log_odds != 0).
     touched = np.abs(prob - 0.5) > 1e-9
     occ_mask = touched & (prob > 0.5)
     free_mask = touched & (prob < 0.5)
@@ -207,12 +222,11 @@ def classify_dot_grid(poses, scans, resolution=OCC_RES):
 
 def _draw_dot_grid(ax, free_xy, occ_xy, *, free_size=6, occ_size=14,
                    free_alpha=1.0, occ_alpha=1.0, zorder=1, with_label=True):
-    """Scatter the discrete C-space grid. Matches midterm Part1.visualize_c_space:
-       lightblue free dots, red occupied dots."""
+    """Lightblue free dots, red occupied dots — midterm Problem 3 style."""
     free_lbl = 'Free Space ($C_{free}$)' if with_label else None
     occ_lbl = 'Obstacle Space ($C_{obs}$)' if with_label else None
     if free_xy.size:
-        ax.scatter(free_xy[:, 0], free_xy[:, 1], c='lightblue',
+        ax.scatter(free_xy[:, 0], free_xy[:, 1], c='lightgray',
                    s=free_size, alpha=free_alpha, zorder=zorder,
                    label=free_lbl)
     if occ_xy.size:
@@ -221,46 +235,142 @@ def _draw_dot_grid(ax, free_xy, occ_xy, *, free_size=6, occ_size=14,
                    label=occ_lbl)
 
 
-def plot_occupancy_map(_unused_occ, poses, scans, out_path):
-    """Discrete C-space dot grid (midterm Problem 3 style): each cell is a
-    coloured dot — lightblue=free (rays passed through), red=occupied (a beam
-    endpoint landed there). Trajectory overlaid as a blue line."""
+def _draw_goals(ax):
+    """Both leg goals — filled green squares; return has a heavier black
+    border to read as the final/landing target."""
+    ax.plot(OUTBOUND_GOAL[0], OUTBOUND_GOAL[1], 's',
+            markerfacecolor='green', markeredgecolor='black',
+            markeredgewidth=0.8, markersize=8, zorder=6,
+            label='Outbound goal (pad)')
+    ax.plot(RETURN_GOAL[0], RETURN_GOAL[1], 's',
+            markerfacecolor='green', markeredgecolor='black',
+            markeredgewidth=2.5, markersize=8, zorder=6,
+            label='Return goal (origin)')
+
+
+def _draw_world_geometry(ax, *, alpha=0.9, zorder=4):
+    """Overlay GT room outlines from the SDF.
+
+    Walls: solid black, lw=1.5. Obstacles: dashed gray, lw=1.0.
+    A single legend entry "Ground truth (SDF)" is attached to the first
+    wall edge drawn; subsequent edges share styling but no label.
+    """
+    labelled = False
+    for xmin, xmax, ymin, ymax, kind in WORLD_GEOMETRY_BOXES:
+        xs = [xmin, xmax, xmax, xmin, xmin]
+        ys = [ymin, ymin, ymax, ymax, ymin]
+        if kind == 'wall':
+            color, ls, lw = 'black', '-', 1.5
+        else:
+            color, ls, lw = 'dimgray', '--', 1.0
+        lbl = 'Ground truth (SDF)' if not labelled else None
+        labelled = True
+        ax.plot(xs, ys, color=color, linestyle=ls, linewidth=lw,
+                alpha=alpha, zorder=zorder, label=lbl)
+
+
+def read_final_landmark_lines(bag_path):
+    """Single pass — return the final /ekf_slam/debug/landmark_lines
+    MarkerArray as a list of (p1, p2) numpy-pair tuples in world frame.
+
+    Skips the DELETEALL sentinel marker the EKF emits at index 0, and
+    any non-LINE_STRIP markers. Multi-segment LINE_STRIPs are walked as
+    consecutive pairs (today the EKF emits 2-point strips, but this is
+    defensive)."""
+    reader, type_map = open_reader(bag_path)
+    topic = '/ekf_slam/debug/landmark_lines'
+    if topic not in type_map:
+        raise RuntimeError(f"{topic} not found in {bag_path}")
+    MarkerArray = get_message(type_map[topic])
+
+    last_msg = None
+    while reader.has_next():
+        topic_, data, _t_ns = reader.read_next()
+        if topic_ == topic:
+            last_msg = deserialize_message(data, MarkerArray)
+
+    if last_msg is None:
+        return []
+
+    LINE_STRIP, ADD = 4, 0
+    segments = []
+    for m in last_msg.markers:
+        if m.type != LINE_STRIP or m.action != ADD or len(m.points) < 2:
+            continue
+        for i in range(len(m.points) - 1):
+            p1 = np.array([m.points[i].x,     m.points[i].y])
+            p2 = np.array([m.points[i + 1].x, m.points[i + 1].y])
+            segments.append((p1, p2))
+    return segments
+
+
+def read_final_corner_markers(bag_path):
+    """Single pass — return the final /ekf_slam/debug/landmark_corners
+    MarkerArray as a list of (x, y) tuples in world frame.
+
+    Skips the DELETEALL sentinel (action=3); MODIFY (2) and ADD (0) both
+    pass through, since the EKF emits MODIFY for the persistent corner set."""
+    reader, type_map = open_reader(bag_path)
+    topic = '/ekf_slam/debug/landmark_corners'
+    if topic not in type_map:
+        return []
+    MarkerArray = get_message(type_map[topic])
+
+    last_msg = None
+    while reader.has_next():
+        topic_, data, _t_ns = reader.read_next()
+        if topic_ == topic:
+            last_msg = deserialize_message(data, MarkerArray)
+
+    if last_msg is None:
+        return []
+
+    DELETEALL = 3
+    corners = []
+    for m in last_msg.markers:
+        if m.action == DELETEALL:
+            continue
+        corners.append((m.pose.position.x, m.pose.position.y))
+    return corners
+
+
+def plot_occupancy_map(label, poses, scans, out_path):
+    """Discrete C-space dot grid + trajectory + both leg goals."""
     grid = classify_dot_grid(poses, scans, resolution=OCC_RES)
     if grid is None:
-        print("  WARNING: no scan endpoints; skipping occupancy plot.")
+        print(f"  WARNING ({label}): no scan endpoints; skipping occupancy plot.")
         return
-    free_xy, occ_xy, x_min, y_min, res, nx, ny = grid
+    free_xy, occ_xy, *_ = grid
 
     fig, ax = plt.subplots(figsize=(10, 8))
     _draw_dot_grid(ax, free_xy, occ_xy, free_size=6, occ_size=14, zorder=1)
 
     if poses['x'].size:
-        ax.plot(poses['x'], poses['y'], '-', color='blue',
-                lw=1.5, alpha=0.85, zorder=3, label='EKF trajectory')
-        ax.plot(poses['x'][0], poses['y'][0], 'go',
-                markersize=10, zorder=5, label='Start')
-    ax.plot(GOAL[0], GOAL[1], '*', color='gold',
-            markersize=18, markeredgecolor='black', zorder=5, label='Goal')
+        ax.plot(poses['x'], poses['y'], '-', color='rebeccapurple',
+                lw=1.2, alpha=0.9, zorder=3, label='Trajectory')
+        ax.plot(poses['x'][0], poses['y'][0], 'o', color='rebeccapurple',
+                markersize=6, zorder=5, label='Start')
+    _draw_goals(ax)
 
-    ax.set_xlim(x_min, x_min + nx * res)
-    ax.set_ylim(y_min, y_min + ny * res)
+    ax.set_xlim(COMMON_BOUNDS[0], COMMON_BOUNDS[1])
+    ax.set_ylim(COMMON_BOUNDS[2], COMMON_BOUNDS[3])
     ax.set_xlabel('X (meters)')
     ax.set_ylabel('Y (meters)')
-    ax.set_title(f'Discretized Occupancy Grid (C-space style, {res:.2f} m cells)')
+    ax.set_title(f'Discretized Occupancy Grid — {label} '
+                 f'({OCC_RES:.2f} m cells)')
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.25)
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', fontsize=8)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    print(f"  wrote {out_path}  (grid: {nx}x{ny} cells, "
-          f"free={len(free_xy)}, occupied={len(occ_xy)})")
+    print(f"  wrote {out_path}  (free={len(free_xy)}, occupied={len(occ_xy)})")
 
 
 def beam_endpoints_world(poses, scans):
     """For each scan, look up the nearest pose in time and project the four
-    beam endpoints into the world frame. Returns arrays of equal length:
+    beam endpoints into the world frame. Returns:
         endpoints_x, endpoints_y, beam_index (0..3), scan_time
     Beams that hit max-range or come back NaN are dropped."""
     if poses['t'].size == 0 or scans['t'].size == 0:
@@ -271,7 +381,6 @@ def beam_endpoints_world(poses, scans):
     sx, sy, si, st = [], [], [], []
 
     for s_t, ranges in zip(scans['t'], scans['ranges']):
-        # nearest-neighbour pose
         idx = int(np.searchsorted(pt, s_t))
         if idx >= len(pt):
             idx = len(pt) - 1
@@ -297,13 +406,12 @@ def beam_endpoints_world(poses, scans):
     return np.array(sx), np.array(sy), np.array(si, dtype=int), np.array(st)
 
 
-def plot_scan_endpoints(poses, scans, out_path):
+def plot_scan_endpoints(label, poses, scans, out_path):
     sx, sy, _, st = beam_endpoints_world(poses, scans)
 
     fig, ax = plt.subplots(figsize=(9, 9))
 
     if sx.size:
-        # Color by elapsed time — early=blue, late=red
         t0 = st.min()
         t_norm = (st - t0) / max(st.max() - t0, 1e-6)
         sc = ax.scatter(sx, sy, c=t_norm, cmap='coolwarm', s=8, alpha=0.8)
@@ -311,19 +419,21 @@ def plot_scan_endpoints(poses, scans, out_path):
         cb.set_label('time (early → late)')
 
     if poses['x'].size:
-        ax.plot(poses['x'], poses['y'], '-', color='black',
-                lw=2.0, label='EKF trajectory')
-        ax.plot(poses['x'][0], poses['y'][0], 'o', color='green',
-                markersize=8, label='start')
-    ax.plot(GOAL[0], GOAL[1], '*', color='gold',
-            markersize=14, markeredgecolor='black', label='goal')
+        ax.plot(poses['x'], poses['y'], '-', color='rebeccapurple',
+                lw=1.2, label='Trajectory')
+        ax.plot(poses['x'][0], poses['y'][0], 'o', color='rebeccapurple',
+                markersize=6, label='Start')
+    _draw_world_geometry(ax, alpha=0.9, zorder=4)
+    _draw_goals(ax)
 
+    ax.set_xlim(COMMON_BOUNDS[0], COMMON_BOUNDS[1])
+    ax.set_ylim(COMMON_BOUNDS[2], COMMON_BOUNDS[3])
     ax.set_xlabel('x [m]')
     ax.set_ylabel('y [m]')
-    ax.set_title('Raw Laser Scan Endpoints in World Frame')
+    ax.set_title(f'Raw Laser Scan Endpoints in World Frame — {label}')
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', fontsize=8)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -342,13 +452,11 @@ def plot_scan_endpoints(poses, scans, out_path):
 # ---------------------------------------------------------------------------
 
 CLUSTER_DIST = 0.30      # m, sequential gap that breaks a cluster
-IEPF_THRESH = 0.08       # m, max perpendicular distance before splitting at a corner
-MIN_CLUSTER_PTS = 3      # min points to bother fitting a line
+IEPF_THRESH = 0.15       # m, max perpendicular distance before splitting at a corner
+MIN_CLUSTER_PTS = 6      # min points to bother fitting a line
 
 
 def cluster_points(points, distance_threshold):
-    """Walk the points in order and split a new cluster whenever consecutive
-    Euclidean distance exceeds distance_threshold."""
     if len(points) == 0:
         return []
     clusters = []
@@ -365,10 +473,6 @@ def cluster_points(points, distance_threshold):
 
 
 def split_and_merge(cluster, threshold):
-    """Iterative End-Point Fit: connect the cluster's first and last points
-    with a line, find the point with the largest orthogonal distance to that
-    line, and if it exceeds the threshold split the cluster there and
-    recurse. Otherwise the cluster is one straight segment."""
     if len(cluster) <= 2:
         return [cluster]
 
@@ -379,7 +483,6 @@ def split_and_merge(cluster, threshold):
     if line_len == 0.0:
         return [cluster]
 
-    # Cross-product magnitude divided by line length = perpendicular distance.
     point_vecs = cluster - start_p
     cross = np.abs(point_vecs[:, 0] * line_vec[1] - point_vecs[:, 1] * line_vec[0])
     distances = cross / line_len
@@ -388,7 +491,6 @@ def split_and_merge(cluster, threshold):
     max_dist = float(distances[max_idx])
 
     if max_dist > threshold:
-        # Both halves share the corner point so neither side loses information.
         left = split_and_merge(cluster[:max_idx + 1], threshold)
         right = split_and_merge(cluster[max_idx:], threshold)
         return left + right
@@ -396,9 +498,6 @@ def split_and_merge(cluster, threshold):
 
 
 def total_least_squares(cluster):
-    """TLS line fit via eigendecomposition. Returns (n, n0) so n . p = n0
-    is the line. Smallest eigenvector of the centred covariance is the
-    normal."""
     x = cluster[:, 0]
     y = cluster[:, 1]
     mean_x = float(np.mean(x))
@@ -417,8 +516,6 @@ def total_least_squares(cluster):
 
 
 def get_line_segment(cluster, n, n0):
-    """Project the cluster onto the line direction; the extreme projections
-    give a bounded segment that doesn't extrapolate beyond the data."""
     direction = np.array([n[1], -n[0]])
     projections = cluster @ direction
     min_idx = int(np.argmin(projections))
@@ -431,13 +528,11 @@ def get_line_segment(cluster, n, n0):
     return project(cluster[min_idx]), project(cluster[max_idx])
 
 
-def plot_line_extraction(poses, scans, out_path):
+def plot_line_extraction(label, poses, scans, out_path):
     sx, sy, si, st = beam_endpoints_world(poses, scans)
 
     fig, ax = plt.subplots(figsize=(9, 9))
 
-    # Discretized environment underneath so the extracted lines visibly
-    # correspond to walls. Lower opacity so the red lines stay dominant.
     grid = classify_dot_grid(poses, scans, resolution=OCC_RES)
     if grid is not None:
         free_xy, occ_xy, *_ = grid
@@ -450,15 +545,12 @@ def plot_line_extraction(poses, scans, out_path):
 
         # The midterm's cluster_points assumes consecutive points came off
         # the same surface — true for a single dense angular sweep, but our
-        # data is 377 sparse 4-beam scans where adjacent entries in the
-        # array typically point at different walls. To recover meaningful
-        # sequential order we feed each beam direction as its own ordered
-        # stream (one beam slides continuously along one wall as the drone
-        # moves). All resulting clusters from all beams pool together for
-        # IEPF/TLS — this is NOT fitting per-beam, it's just using beam
-        # index to recover the "consecutive == same surface" property the
-        # midterm relies on. A single wall seen by two beams will produce
-        # two clusters that both fit the same line — fine.
+        # data is sparse 4-beam scans where adjacent entries in the array
+        # typically point at different walls. To recover the "consecutive ==
+        # same surface" property, feed each beam direction as its own
+        # ordered stream (one beam slides continuously along one wall as
+        # the drone moves). All resulting clusters from all beams pool
+        # together for IEPF/TLS.
         points = np.column_stack([sx, sy])
         initial = []
         for beam in np.unique(si):
@@ -482,25 +574,27 @@ def plot_line_extraction(poses, scans, out_path):
         for i, (p1, p2) in enumerate(segments):
             lbl = 'Reconstructed Segment' if i == 0 else None
             ax.plot([p1[0], p2[0]], [p1[1], p2[1]],
-                    color='red', linewidth=3, zorder=4, label=lbl)
+                    color='red', linewidth=2, zorder=4, label=lbl)
 
         print(f"  initial clusters: {len(initial)}  "
               f"after IEPF: {len(refined)}  fitted segments: {len(segments)}")
 
     if poses['x'].size:
-        ax.plot(poses['x'], poses['y'], '-', color='black', lw=1.5,
-                zorder=3, label='EKF trajectory')
-        ax.plot(poses['x'][0], poses['y'][0], 'o', color='green',
-                markersize=8, zorder=5, label='start')
-    ax.plot(GOAL[0], GOAL[1], '*', color='gold',
-            markersize=14, markeredgecolor='black', zorder=5, label='goal')
+        ax.plot(poses['x'], poses['y'], '-', color='rebeccapurple', lw=1.2,
+                zorder=3, label='Trajectory')
+        ax.plot(poses['x'][0], poses['y'][0], 'o', color='rebeccapurple',
+                markersize=6, zorder=5, label='Start')
+    _draw_world_geometry(ax, alpha=0.4, zorder=2)
+    _draw_goals(ax)
 
+    ax.set_xlim(COMMON_BOUNDS[0], COMMON_BOUNDS[1])
+    ax.set_ylim(COMMON_BOUNDS[2], COMMON_BOUNDS[3])
     ax.set_xlabel('x [m]')
     ax.set_ylabel('y [m]')
-    ax.set_title('Extracted Wall/Obstacle Lines (over discretized C-space)')
+    ax.set_title(f'Extracted Wall/Obstacle Lines — {label}')
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', fontsize=8)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -508,29 +602,92 @@ def plot_line_extraction(poses, scans, out_path):
     print(f"  wrote {out_path}")
 
 
+def plot_ekf_landmarks(label, bag_path, out_path):
+    """Final state of /ekf_slam/debug/landmark_lines, plus GT overlay.
+
+    Each landmark is a LINE_STRIP with 2 points; rendered as a red line
+    with small dots at each endpoint so the reader can see where the EKF
+    thinks each tracked surface starts and ends relative to the GT walls.
+    """
+    segments = read_final_landmark_lines(bag_path)
+    corners  = read_final_corner_markers(bag_path)
+
+    fig, ax = plt.subplots(figsize=(9, 9))
+    _draw_world_geometry(ax, alpha=0.4, zorder=2)
+
+    if not segments:
+        ax.text(0.5, 0.5, 'no EKF landmarks in final MarkerArray',
+                transform=ax.transAxes, ha='center', va='center',
+                color='dimgray', fontsize=12)
+        print(f"  WARNING ({label}): final landmark_lines MarkerArray was empty.")
+
+    for i, (p1, p2) in enumerate(segments):
+        line_lbl = 'EKF tracked landmark' if i == 0 else None
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]],
+                color='red', linewidth=2, zorder=4, label=line_lbl)
+
+    for i, (cx, cy) in enumerate(corners):
+        corner_lbl = 'EKF corner landmark' if i == 0 else None
+        ax.plot(cx, cy, marker='o', color='orange', markersize=8,
+                markeredgecolor='black', markeredgewidth=0.8,
+                linestyle='None', zorder=6, label=corner_lbl)
+
+    _draw_goals(ax)
+
+    ax.set_xlim(COMMON_BOUNDS[0], COMMON_BOUNDS[1])
+    ax.set_ylim(COMMON_BOUNDS[2], COMMON_BOUNDS[3])
+    ax.set_xlabel('x [m]')
+    ax.set_ylabel('y [m]')
+    ax.set_title(f'EKF tracked landmarks (lines + corners) — final state — {label}')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper right', fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}  ({len(segments)} lines, {len(corners)} corners)")
+
+
 def main():
-    if not os.path.isdir(BAG):
-        print(f"ERROR: bag directory not found: {BAG}", file=sys.stderr)
-        return 1
+    bags = [
+        (HEADLINE_EKF_BAG,  'EKF Run 2',  'ekf'),
+        (HEADLINE_ODOM_BAG, 'Odom Run 2', 'odom'),
+    ]
 
-    print(f"Reading bag: {BAG}")
-    last_map, poses, scans = read_bag(BAG)
-    print(f"  poses : {poses['t'].size}")
-    print(f"  scans : {scans['t'].size}")
-    print(f"  map   : {'present' if last_map is not None else 'MISSING'}")
+    for bag_path, _label, _suffix in bags:
+        if not os.path.isdir(bag_path):
+            print(f"ERROR: bag directory not found: {bag_path}", file=sys.stderr)
+            return 1
 
-    if scans['t'].size == 0:
-        print("ERROR: no /crazyflie/scan messages in bag; cannot render "
-              "occupancy plot", file=sys.stderr)
-        return 1
+    os.makedirs(FIGURES_DIR, exist_ok=True)
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    plot_occupancy_map(last_map, poses, scans,
-                       os.path.join(RESULTS_DIR, 'occupancy_map.png'))
-    plot_scan_endpoints(poses, scans,
-                        os.path.join(RESULTS_DIR, 'scan_endpoints.png'))
-    plot_line_extraction(poses, scans,
-                         os.path.join(RESULTS_DIR, 'line_extraction.png'))
+    for bag_path, label, suffix in bags:
+        print(f"Reading bag ({label}): {bag_path}")
+        _last_map, poses, scans = read_bag(bag_path)
+        print(f"  poses : {poses['t'].size}")
+        print(f"  scans : {scans['t'].size}")
+
+        if scans['t'].size == 0:
+            print(f"ERROR ({label}): no /crazyflie/scan messages; skipping.",
+                  file=sys.stderr)
+            continue
+
+        plot_occupancy_map(
+            label, poses, scans,
+            os.path.join(FIGURES_DIR, f'map_occupancy_{suffix}.png'))
+        plot_scan_endpoints(
+            label, poses, scans,
+            os.path.join(FIGURES_DIR, f'map_scan_endpoints_{suffix}.png'))
+        plot_line_extraction(
+            label, poses, scans,
+            os.path.join(FIGURES_DIR, f'map_line_extraction_{suffix}.png'))
+
+    print(f"Reading EKF landmarks: {HEADLINE_EKF_BAG}")
+    plot_ekf_landmarks(
+        'EKF Run 2', HEADLINE_EKF_BAG,
+        os.path.join(FIGURES_DIR, 'map_landmarks_ekf.png'))
+
     return 0
 
 
