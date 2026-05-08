@@ -23,6 +23,28 @@ produced the run2 bags.
 
 ---
 
+## Progress log
+
+**Retargeted (✅ done):**
+- `compare_nav_runs.py` — commit `78fd960`. Outputs `results/figures/nav_comparison_trajectories.png` and `nav_comparison_summary.txt` with belief/truth/divergence metrics for both legs.
+- `analyze_flight_dynamics.py` — commit `860298e`. Scoped to xyz dynamics; outputs `flight_xyz_final_ekf_bag_run2.png` and `flight_xyz_final_odom_bag_run2.png`. Yaw and cmd_vel helpers preserved but not invoked (yaw belongs in the future drift-over-time script).
+
+**Remaining keeper retargets (Phase 1):**
+- `analyze_map.py`
+- `plot_landmarks.py`
+- `plot_ekf_vs_odom_maps.py`
+- `quantify_slam_error.py`
+
+**New scripts to write (Phase 2, in order):**
+- `plot_drift_over_time.py` — today
+- `plot_covariance_ellipses.py`
+- `plot_ate_rpe.py`
+- `plot_landmark_growth.py`
+- `plot_innovation.py`
+- `plot_landing_zoom.py`
+
+---
+
 ## Headline dataset — four bags, two-sample design
 
 All bags safety-copied to `analysis/headline_bags/` and verified.
@@ -151,6 +173,78 @@ do not over-claim system reliability.
   Run 1 commits. Submodule dirty as expected (down_range sensor, world
   obstacles); model.sdf has down_range gpu_lidar at line 74; mesh URIs
   relative; no absolute paths. Verified earlier in session.
+
+---
+
+## Phase 2 specs
+
+Durable specs for the new analysis scripts. Written here so that future
+sessions don't have to reconstruct intent from chat history.
+
+### `plot_drift_over_time.py`
+
+**Purpose:** Visually demonstrate the EKF's lower drift rate vs the
+noisy-odom baseline, by plotting belief-vs-truth divergence over time
+for both runs.
+
+**Inputs:**
+- `analysis/headline_bags/final_ekf_bag_run2/` — EKF run
+- `analysis/headline_bags/final_odom_bag_run2/` — Odom run
+- Both paths as constants at the top of the script (mirroring the pattern
+  from `analyze_flight_dynamics.py`).
+
+**For each bag, extract:**
+- `/ekf_pose` — belief (xy position + yaw)
+- `/crazyflie/odom` — ground truth (xy position + yaw)
+- Both topics rebased to t=0 at takeoff.
+
+**Per-bag derived signals (computed on a common time grid via `np.interp`):**
+- `dx(t) = belief_x(t) − truth_x(t)`
+- `dy(t) = belief_y(t) − truth_y(t)`
+- `dyaw(t) = wrap(belief_yaw(t) − truth_yaw(t))` — wrap with
+  `np.arctan2(np.sin(d), np.cos(d))`
+- `d_xy(t) = sqrt(dx² + dy²)` — total xy drift magnitude
+
+(Skip dz — z is identical between belief and truth in the odom run by
+design, and uncorrupted in both pipelines.)
+
+**Two output figures:**
+
+1. **`drift_per_state.png`** — three stacked subplots, shared x-axis (time
+   in seconds):
+   - Top: `dx` (cm) for EKF (blue) and Odom (red)
+   - Middle: `dy` (cm) for EKF (blue) and Odom (red)
+   - Bottom: `dyaw` (degrees) for EKF (blue) and Odom (red)
+   - Each subplot has a horizontal dashed black line at y=0 (zero-drift
+     reference).
+   - Legend on top subplot.
+   - Each line annotated with its endpoint value at the rightmost data point.
+
+2. **`drift_xy_total.png`** — single panel:
+   - x-axis: time (s)
+   - y-axis: `d_xy` (cm) — Euclidean xy drift magnitude
+   - EKF (blue), Odom (red)
+   - Annotate each line with its endpoint drift (cm) and computed average
+     drift rate (cm/s = endpoint / duration).
+   - Legend with explicit drift rates (e.g. "EKF: 0.074 cm/s") computed
+     dynamically — do not hardcode.
+
+**Time alignment:**
+- Each bag rebased to its own t=0 at first `/ekf_pose` sample.
+- Odom line ends at t≈47s; EKF line continues to t≈161s. Don't truncate
+  either — the duration asymmetry is part of the story.
+
+**Helper functions to write:**
+- `read_bag(bag_dir)` — extract belief and truth time series, return as
+  numpy arrays.
+- `compute_drift(belief_t, belief_xyz, belief_yaw, truth_t, truth_xyz,
+  truth_yaw)` — interpolate truth onto belief timestamps, return
+  dx/dy/dyaw/d_xy arrays + the common time vector.
+- `quat_to_yaw(q)` — extract yaw from quaternion (mirrors
+  `analyze_flight_dynamics.py`'s `quat_to_rpy` — name to be reconciled
+  during implementation).
+
+**Output location:** `results/figures/`
 
 ---
 

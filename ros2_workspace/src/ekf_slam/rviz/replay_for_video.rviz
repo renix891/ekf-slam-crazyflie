@@ -64,22 +64,22 @@ Visualization Manager:
         Value: /map_updates
       Use Timestamp: false
       Value: true
-    - Alpha: 0.9
+    - Alpha: 1.0
       Buffer Length: 1
       Class: rviz_default_plugins/Path
-      Color: 102; 51; 153
+      Color: 200; 30; 200
       Enabled: true
       Head Diameter: 0.0
       Head Length: 0.0
       Length: 0.3
       Line Style: Lines
-      Line Width: 0.04
+      Line Width: 0.08
       Name: Planned Path
       Offset:
         X: 0
         Y: 0
         Z: 0
-      Pose Color: 102; 51; 153
+      Pose Color: 200; 30; 200
       Pose Style: None
       Radius: 0.03
       Shaft Diameter: 0.02
@@ -93,8 +93,8 @@ Visualization Manager:
         Value: /planned_path
       Value: true
     - Alpha: 1.0
-      Axes Length: 0.2
-      Axes Radius: 0.03
+      Axes Length: 0.15
+      Axes Radius: 0.02
       Class: rviz_default_plugins/Pose
       Color: 220; 20; 20
       Enabled: true
@@ -103,7 +103,7 @@ Visualization Manager:
       Name: EKF Pose
       Shaft Length: 0.18
       Shaft Radius: 0.025
-      Shape: Arrow
+      Shape: Axes
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -112,7 +112,7 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /ekf_pose
       Value: true
-    - Angle Tolerance: 0.05
+    - Angle Tolerance: 0.0
       Class: rviz_default_plugins/Odometry
       Covariance:
         Orientation:
@@ -129,28 +129,28 @@ Visualization Manager:
           Scale: 1.0
           Value: true
         Value: false
-      Enabled: true
-      Keep: 1
+      Enabled: false
+      Keep: 500
       Name: Odom (truth)
-      Position Tolerance: 0.05
+      Position Tolerance: 0.0
       Shape:
-        Alpha: 0.8
+        Alpha: 0.9
         Axes Length: 0.0
         Axes Radius: 0.0
-        Color: 30; 160; 60
-        Head Length: 0.08
-        Head Radius: 0.04
-        Shaft Length: 0.14
-        Shaft Radius: 0.02
+        Color: 60; 200; 100
+        Head Length: 0.0001
+        Head Radius: 0.0001
+        Shaft Length: 0.0001
+        Shaft Radius: 0.04
         Value: Arrow
       Topic:
         Depth: 5
         Durability Policy: Volatile
         Filter size: 10
-        History Policy: Reliable
+        History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /crazyflie/odom
-      Value: true
+      Value: false
     - Alpha: 1.0
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:

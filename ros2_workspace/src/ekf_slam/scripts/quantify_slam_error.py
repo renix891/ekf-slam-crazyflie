@@ -17,9 +17,11 @@ below LAND_Z).
 Computes:
 
   Bag-wide
-    * Obstacle surface RMS — scan hits within HIT_RADIUS of obstacle_4
-      projected via belief pose, RMS distance to nearest GT box face.
-      Belief-frame is intentional: this measures localization error.
+    * Endpoint-to-surface RMS — every valid scan endpoint, projected via
+      belief pose, RMS distance to the nearest of the eight GT axis-
+      aligned rectangles (four interior obstacles + four 4 m room walls).
+      Per-endpoint nearest-surface assignment is the data-association
+      step. Belief-frame is intentional: this measures localization error.
 
   Per leg (outbound, return)
     * Path efficiency      — straight(start→goal) / actual_path_length,
@@ -194,25 +196,33 @@ def beam_endpoints(belief, scans):
     return np.column_stack([out_x, out_y])
 
 
-def obstacle_surface_rms(endpoints: np.ndarray) -> Tuple[float, int]:
-    """RMS distance from each near-obstacle_4 scan hit to the GT box surface."""
+def endpoint_to_surface_rms(endpoints: np.ndarray) -> Tuple[float, int]:
+    """RMS distance from every scan endpoint to its nearest GT surface.
+
+    The reference set is WORLD_OBSTACLES (four interior obstacles + four
+    room walls), each treated as an axis-aligned rectangle. For each
+    endpoint, the per-rectangle distance is the unsigned point-to-AABB
+    distance (zero if inside, otherwise the L2 distance from the point
+    to the rectangle's nearest edge); the per-endpoint metric is the
+    minimum over all rectangles. The bag-wide value is the RMS over
+    every endpoint. No radius gate, no obstacle-specific filtering.
+    """
     if endpoints.size == 0:
         return float('nan'), 0
-    d_centre = np.hypot(endpoints[:, 0] - OBS_GT[0],
-                        endpoints[:, 1] - OBS_GT[1])
-    mask = d_centre < HIT_RADIUS
-    if mask.sum() == 0:
-        return float('nan'), 0
-    pts = endpoints[mask]
-    xmin, xmax = OBS_GT[0] - OBS_HALF, OBS_GT[0] + OBS_HALF
-    ymin, ymax = OBS_GT[1] - OBS_HALF, OBS_GT[1] + OBS_HALF
-    dx = np.maximum.reduce([np.zeros(len(pts)),
-                            xmin - pts[:, 0], pts[:, 0] - xmax])
-    dy = np.maximum.reduce([np.zeros(len(pts)),
-                            ymin - pts[:, 1], pts[:, 1] - ymax])
-    surf = np.hypot(dx, dy)
-    rms = float(np.sqrt(np.mean(surf ** 2)))
-    return rms, int(mask.sum())
+    px = endpoints[:, 0]
+    py = endpoints[:, 1]
+    n = len(endpoints)
+
+    # Per-endpoint nearest-surface distance, accumulated across rectangles.
+    nearest = np.full(n, np.inf)
+    for xmin, xmax, ymin, ymax in WORLD_OBSTACLES:
+        dx = np.maximum.reduce([np.zeros(n), xmin - px, px - xmax])
+        dy = np.maximum.reduce([np.zeros(n), ymin - py, py - ymax])
+        d  = np.hypot(dx, dy)
+        nearest = np.minimum(nearest, d)
+
+    rms = float(np.sqrt(np.mean(nearest ** 2)))
+    return rms, n
 
 
 def path_length(xs: np.ndarray, ys: np.ndarray) -> float:
@@ -320,7 +330,7 @@ def analyze(label: str, bag_path: str, occ_keys):
     belief, truth, scans = read_bag(bag_path)
 
     endpoints = beam_endpoints(belief, scans)
-    obs_rms, n_hits = obstacle_surface_rms(endpoints)
+    surf_rms, n_endpoints = endpoint_to_surface_rms(endpoints)
 
     legs = detect_legs(truth['t'], truth['z'])
 
@@ -334,8 +344,8 @@ def analyze(label: str, bag_path: str, occ_keys):
 
     return {
         'label': label,
-        'obstacle_surface_rms_m': obs_rms,
-        'obstacle_hits': n_hits,
+        'endpoint_surface_rms_m': surf_rms,
+        'n_endpoints': n_endpoints,
         'n_legs': len(legs),
         'outbound': out_metrics,
         'return':   ret_metrics,
@@ -350,8 +360,8 @@ def fmt(stats_e, stats_o):
 
     lines = []
     lines.append(
-        f"Ground truth obstacle_4 centre: ({OBS_GT[0]:.2f}, {OBS_GT[1]:.2f}) m, "
-        f"size 0.30 m"
+        f"Ground truth surfaces: {len(WORLD_OBSTACLES)} axis-aligned rectangles "
+        f"(4 interior obstacles + 4 room walls)"
     )
     lines.append(
         f"Outbound goal: {OUTBOUND_GOAL}    Return goal: {RETURN_GOAL}    "
@@ -364,14 +374,14 @@ def fmt(stats_e, stats_o):
     lines.append(f"  {'Metric':<32s}{'EKF':<18s}{'Odom-Only':<18s}")
     lines.append('  ' + '-' * 68)
     lines.append(
-        f"  {'Obstacle surface RMS':<32s}"
-        f"{cell(stats_e['obstacle_surface_rms_m'], '{:.3f} m'):<18s}"
-        f"{cell(stats_o['obstacle_surface_rms_m'], '{:.3f} m'):<18s}"
+        f"  {'Endpoint-to-surface RMS':<32s}"
+        f"{cell(stats_e['endpoint_surface_rms_m'], '{:.3f} m'):<18s}"
+        f"{cell(stats_o['endpoint_surface_rms_m'], '{:.3f} m'):<18s}"
     )
     lines.append(
-        f"  {'  (n hits inside window)':<32s}"
-        f"{str(stats_e['obstacle_hits']):<18s}"
-        f"{str(stats_o['obstacle_hits']):<18s}"
+        f"  {'  (n endpoints)':<32s}"
+        f"{str(stats_e['n_endpoints']):<18s}"
+        f"{str(stats_o['n_endpoints']):<18s}"
     )
     lines.append(
         f"  {'  (legs detected, truth z)':<32s}"

@@ -348,6 +348,7 @@ def plot_occupancy_map(label, poses, scans, out_path):
                 lw=1.2, alpha=0.9, zorder=3, label='Trajectory')
         ax.plot(poses['x'][0], poses['y'][0], 'o', color='rebeccapurple',
                 markersize=6, zorder=5, label='Start')
+    _draw_world_geometry(ax, alpha=0.9, zorder=4)
     _draw_goals(ax)
 
     ax.set_xlim(COMMON_BOUNDS[0], COMMON_BOUNDS[1])

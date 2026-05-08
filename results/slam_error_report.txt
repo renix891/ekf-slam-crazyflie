@@ -1,13 +1,13 @@
 SLAM error report — EKF-corrected vs raw odometry (Run 2 headline bags)
 
-Ground truth obstacle_4 centre: (0.40, 0.00) m, size 0.30 m
+Ground truth surfaces: 8 axis-aligned rectangles (4 interior obstacles + 4 room walls)
 Outbound goal: (0.8, 0.0)    Return goal: (0.0, 0.0)    Robot radius: 0.10 m
 
 Bag-wide metrics
   Metric                          EKF               Odom-Only         
   --------------------------------------------------------------------
-  Obstacle surface RMS            0.051 m           0.051 m           
-    (n hits inside window)        1310              346               
+  Endpoint-to-surface RMS         0.085 m           0.113 m           
+    (n endpoints)                 6225              1483              
     (legs detected, truth z)      2                 2                 
 
 Outbound leg  — start (0,0) → goal (0.8, 0.0)
